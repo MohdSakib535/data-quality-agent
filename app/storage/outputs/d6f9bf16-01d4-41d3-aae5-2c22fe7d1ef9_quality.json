@@ -1,0 +1,104 @@
+{
+  "rows_output": 11,
+  "columns_output": 8,
+  "review_rows": 6,
+  "audit_events": 85,
+  "issue_counts": {
+    "HEADER_NORMALIZED": 8,
+    "TEXT_NORMALIZED": 13,
+    "DATE_AMBIGUOUS": 4,
+    "CURRENCY_NORMALIZED": 5,
+    "EMAIL_INVALID": 1,
+    "NUMERIC_NORMALIZED": 2,
+    "DATE_NORMALIZED": 4,
+    "NULL_NORMALIZED": 1,
+    "DATE_INVALID": 1,
+    "PERCENTAGE_NORMALIZED": 1,
+    "DUPLICATE_ROW_DROPPED": 1,
+    "AI_CLEANING": 44
+  },
+  "columns": {
+    "full_name": {
+      "null_ratio": 0.0,
+      "unique_ratio": 1.0,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "TEXT_NORMALIZED": 2,
+        "AI_CLEANING": 11
+      }
+    },
+    "email_address": {
+      "null_ratio": 0.18181818181818182,
+      "unique_ratio": 1.0,
+      "review_count": 1,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "TEXT_NORMALIZED": 1,
+        "EMAIL_INVALID": 1
+      }
+    },
+    "phone_number": {
+      "null_ratio": 0.2727272727272727,
+      "unique_ratio": 1.0,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "NULL_NORMALIZED": 1
+      }
+    },
+    "city": {
+      "null_ratio": 0.0,
+      "unique_ratio": 0.8181818181818182,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "TEXT_NORMALIZED": 3,
+        "AI_CLEANING": 11
+      }
+    },
+    "join_date": {
+      "null_ratio": 0.09090909090909091,
+      "unique_ratio": 1.0,
+      "review_count": 5,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "DATE_AMBIGUOUS": 4,
+        "DATE_NORMALIZED": 4,
+        "DATE_INVALID": 1
+      }
+    },
+    "amount_score": {
+      "null_ratio": 0.09090909090909091,
+      "unique_ratio": 0.9,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "CURRENCY_NORMALIZED": 5,
+        "NUMERIC_NORMALIZED": 2,
+        "TEXT_NORMALIZED": 1,
+        "PERCENTAGE_NORMALIZED": 1
+      }
+    },
+    "status": {
+      "null_ratio": 0.2727272727272727,
+      "unique_ratio": 0.625,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "TEXT_NORMALIZED": 4,
+        "AI_CLEANING": 11
+      }
+    },
+    "job_title": {
+      "null_ratio": 0.0,
+      "unique_ratio": 0.7272727272727273,
+      "review_count": 0,
+      "issue_counts": {
+        "HEADER_NORMALIZED": 1,
+        "TEXT_NORMALIZED": 2,
+        "AI_CLEANING": 11
+      }
+    }
+  }
+}

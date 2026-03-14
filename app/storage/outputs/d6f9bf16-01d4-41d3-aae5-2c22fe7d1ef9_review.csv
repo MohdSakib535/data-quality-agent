@@ -1,0 +1,7 @@
+full_name,email_address,phone_number,city,join_date,amount_score,status,job_title,_review_column,_reason_for_review,_confidence,_suggested_value,_issue_code,_review_source
+John Doe,john.doe@example.com,9876543210,Delhi,01/02/2025,"₹12,500",Paid, ui ux desginer ,join_date,Deterministic validation failed for inferred type 'date',0.0,,DATE_AMBIGUOUS,deterministic
+Rahul Verma,rahul.verma@example,91-98765-43210,Bengaluru,03-04-2025,"12,500.00", Pending,frontend devloper,email_address,Deterministic validation failed for inferred type 'email',0.0,,EMAIL_INVALID,deterministic
+Rahul Verma,rahul.verma@example,91-98765-43210,Bengaluru,03-04-2025,"12,500.00", Pending,frontend devloper,join_date,Deterministic validation failed for inferred type 'date',0.0,,DATE_AMBIGUOUS,deterministic
+Sneha Rao,sneha.rao@example.com,,Hyderabad,06-05-25,8000 ,success ,data Analist,join_date,Deterministic validation failed for inferred type 'date',0.0,,DATE_AMBIGUOUS,deterministic
+John Doe,john.doe@example.com,9876543210,Delhi,01/02/2025,"₹12,500",Paid, ui ux desginer ,join_date,Deterministic validation failed for inferred type 'date',0.0,,DATE_AMBIGUOUS,deterministic
+Arjun Rawat,arjun rawat0722@gmail.com,,Noida,13/13/2025,"1,2,3,4",unknown,mouse pad seller,join_date,Deterministic validation failed for inferred type 'date',0.0,,DATE_INVALID,deterministic

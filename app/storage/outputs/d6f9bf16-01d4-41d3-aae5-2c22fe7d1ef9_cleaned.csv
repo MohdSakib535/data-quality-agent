@@ -1,0 +1,12 @@
+full_name,email_address,phone_number,city,join_date,amount_score,status,job_title
+John Doe,john.doe@example.com,9876543210,Delhi,01/02/2025,12500,Paid,UI/UX Designer
+Jane Smith,JANE.SMITH@EXAMPLE.COM,0987654321,Mumbai,2025-02-03,12500,Paid,Product Designer
+Rahul Verma,rahul.verma@example,91-98765-43210,Bengaluru,03-04-2025,12500,Pending,Frontend Developer
+Priya Singh,,,Chennai,2025-04-05,,Failed,Graphic Designer
+Amit Kumar,amit.kumar@example.com,98765 43210,Delhi,2025-05-06,8000,Success,Data Analyst
+Sneha Rao,sneha.rao@example.com,,Hyderabad,06-05-25,8000,Success,Data Analyst
+Vikas Patel,vpatel@example.com,9999999999,Pune,2025-06-07,150,Refunded,Sales Manager
+Neha Gupta,neha.gupta@example.com,8888888888,Pune,,150,Refunded,Sales Manager
+Arjun Rawat,arjun rawat0722@gmail.com,,Noida,13/13/2025,1234,,Mouse Pad Seller
+Kavya Nair,,7777777777,Kochi,2025-07-15T10:30:00,45,,Marketing Lead
+Mohit Sharma,mohit.sharma@example.com,6666666666,Jaipur,2025-08-15,1000.5,,Marketing Lead
