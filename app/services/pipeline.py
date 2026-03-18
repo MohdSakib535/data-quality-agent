@@ -5,6 +5,11 @@ from app.services.ai_cleaner import analyze_dataset, clean_dataset_with_prompt
 from app.schemas.models import DatasetAnalysisResponse, CleanDataResponse
 from app.core.config import settings
 
+
+def _dataframe_to_json_records(df: pd.DataFrame):
+    cleaned_df = df.where(pd.notnull(df), None)
+    return cleaned_df.to_dict(orient="records")
+
 def analyze_csv(job_id: str) -> DatasetAnalysisResponse:
     """
     Load the CSV and run a pure LLM analysis over a sample.
@@ -34,5 +39,6 @@ def clean_csv_with_prompt(job_id: str, prompt: str) -> CleanDataResponse:
     return CleanDataResponse(
         job_id=job_id,
         status="completed",
-        cleaned_file_url=f"/api/download-cleaned/{job_id}"
+        cleaned_file_url=f"/api/v1/download-cleaned/{job_id}",
+        cleaned_data=_dataframe_to_json_records(cleaned_df),
     )

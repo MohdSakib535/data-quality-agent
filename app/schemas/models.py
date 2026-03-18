@@ -35,3 +35,7 @@ class CleanDataResponse(BaseModel):
     job_id: str = Field(description="The job ID")
     status: str = Field(description="Status of the request (e.g., success, failed)")
     cleaned_file_url: str = Field(description="Endpoint URL to download the cleaned CSV")
+    cleaned_data: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="All cleaned rows returned as JSON records",
+    )

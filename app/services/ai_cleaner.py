@@ -56,12 +56,80 @@ def _suggestion_key(suggestion: DataSuggestion) -> str:
     )
 
 
+def _generic_resolution_prompt(issue_description: str, current_prompt: str) -> str:
+    suggestion_text = f"{issue_description} {current_prompt}".lower()
+
+    if any(keyword in suggestion_text for keyword in ["missing", "null", "blank", "empty", "n/a"]):
+        return (
+            "Review the dataset for missing or placeholder values across all affected columns and replace them "
+            "with the literal string N/A wherever the value is missing. Treat blank strings, whitespace-only "
+            "cells, null, NULL, NA, -, unknown, and other visibly empty placeholders as missing values. Apply "
+            "the replacement consistently across the dataset, preserve all non-empty valid values as they are, "
+            "and do not invent or guess any new data beyond converting missing entries to N/A."
+        )
+
+    if "duplicate" in suggestion_text:
+        return (
+            "Identify exact duplicate records across the dataset and remove redundant copies while keeping one "
+            "canonical version of each repeated row. Preserve legitimate repeated values that are not true "
+            "duplicates, and avoid merging rows unless all corresponding fields clearly represent the same record."
+        )
+
+    if any(keyword in suggestion_text for keyword in ["header", "column name", "column names", "snake_case"]):
+        return (
+            "Normalize all column headers consistently across the dataset. Trim surrounding whitespace, remove "
+            "punctuation noise, convert names to lowercase snake_case, and ensure each header is clear, stable, "
+            "and unique without changing the meaning of the column."
+        )
+
+    if "whitespace" in suggestion_text or "leading or trailing" in suggestion_text:
+        return (
+            "Trim leading and trailing whitespace in all affected text fields across the dataset. Preserve "
+            "meaningful internal spacing unless it is clearly accidental, and ensure values that become empty "
+            "after trimming are handled consistently as blank or missing data."
+        )
+
+    if any(keyword in suggestion_text for keyword in ["capitalization", "casing", "spelling", "formatting"]):
+        return (
+            "Standardize capitalization, spelling, and formatting for repeated text values that represent the same "
+            "meaning. Apply one canonical form consistently across the dataset while preserving genuinely distinct "
+            "values and avoiding unsupported corrections."
+        )
+
+    return (
+        f"Apply a consistent dataset-wide cleaning rule for this issue: {issue_description.strip()} "
+        "Review all affected rows and columns, standardize equivalent values into one canonical format, preserve "
+        "valid distinctions, and avoid guessing or changing unrelated data."
+    )
+
+
+def _normalize_analysis_suggestion(suggestion: DataSuggestion) -> DataSuggestion:
+    return DataSuggestion(
+        issue_description=suggestion.issue_description.strip(),
+        priority=suggestion.priority.strip(),
+        resolution_prompt=_generic_resolution_prompt(
+            suggestion.issue_description,
+            suggestion.resolution_prompt,
+        ),
+    )
+
+
 def _merge_analysis_payloads(
     deterministic: DatasetAnalysisPayload,
     ai_payload: DatasetAnalysisPayload | None,
 ) -> DatasetAnalysisPayload:
+    deterministic = DatasetAnalysisPayload(
+        quality_score=deterministic.quality_score,
+        suggestions=[_normalize_analysis_suggestion(s) for s in deterministic.suggestions],
+    )
+
     if ai_payload is None:
         return deterministic
+
+    ai_payload = DatasetAnalysisPayload(
+        quality_score=ai_payload.quality_score,
+        suggestions=[_normalize_analysis_suggestion(s) for s in ai_payload.suggestions],
+    )
 
     merged_suggestions: List[DataSuggestion] = []
     seen = set()
@@ -146,6 +214,56 @@ def _normalize_cleaned_batch_payload(cleaned_batch: Any) -> Any:
             if isinstance(value, list):
                 return value
     return cleaned_batch
+
+
+def _trim_whitespace_in_string_cells(df: pd.DataFrame) -> pd.DataFrame:
+    trimmed_df = df.copy()
+
+    for column in trimmed_df.columns:
+        series = trimmed_df[column]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            trimmed_df[column] = series.map(
+                lambda value: value.strip() if isinstance(value, str) else value
+            )
+
+    return trimmed_df
+
+
+def _should_remove_exact_duplicates(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+
+    duplicate_terms = [
+        "duplicate",
+        "duplicates",
+        "deduplicate",
+        "dedup",
+        "redundant copies",
+    ]
+    removal_terms = [
+        "remove",
+        "drop",
+        "delete",
+        "keep one",
+        "canonical",
+    ]
+
+    return (
+        any(term in normalized_prompt for term in duplicate_terms)
+        and any(term in normalized_prompt for term in removal_terms)
+    ) or "exact duplicate" in normalized_prompt
+
+
+def _remove_exact_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
+    return df.drop_duplicates().reset_index(drop=True)
+
+
+def _build_cleaning_chain():
+    llm = ChatOllama(
+        model=settings.OLLAMA_MODEL,
+        base_url=settings.OLLAMA_BASE_URL,
+        temperature=0.0,
+    )
+    return clean_data_prompt_template | llm | StrOutputParser()
 
 
 def _invoke_cleaning_batch(
@@ -240,8 +358,10 @@ def clean_dataset_with_prompt(df: pd.DataFrame, user_prompt: str) -> pd.DataFram
     """
     Iterate through the dataframe in small batches, applying the user's cleaning prompt.
     """
-    llm = ChatOllama(model=settings.OLLAMA_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.0)
-    chain = clean_data_prompt_template | llm | StrOutputParser()
+    df = _trim_whitespace_in_string_cells(df)
+    if _should_remove_exact_duplicates(user_prompt):
+        df = _remove_exact_duplicate_rows(df)
+    chain = _build_cleaning_chain()
     
     batch_size = 20
     cleaned_rows = []

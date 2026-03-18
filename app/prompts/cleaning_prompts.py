@@ -12,8 +12,10 @@ RULES:
 2. Return at most 5 suggestions.
 3. Suggestions must be dataset-level and generic. Focus on broad issues affecting multiple rows, multiple columns, or overall consistency.
 4. Do NOT produce one suggestion per column or per header unless a repeated systemic issue clearly affects many columns.
-5. Each resolution_prompt must be detailed enough for another AI cleaning step to execute.
-6. Return strictly valid JSON matching the requested schema.
+5. Each resolution_prompt must be a generic but detailed cleaning instruction that another AI step can execute without extra explanation.
+6. Avoid mentioning specific column names unless they are absolutely required to describe a dataset-wide pattern.
+7. Explain the intended cleaning action, guardrails, and what should not be changed.
+8. Return strictly valid JSON matching the requested schema.
 """
 
 USER_ANALYSIS_PROMPT = """

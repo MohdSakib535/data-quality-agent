@@ -47,8 +47,12 @@ def analyze_dataset_deterministically(df: pd.DataFrame) -> DatasetAnalysisPayloa
                 ),
                 priority=priority,
                 resolution_prompt=(
-                    "Standardize missing value tokens, convert blank placeholders to null, and fill or remove "
-                    "missing values only where appropriate for each column type."
+                    "Review the dataset for missing or placeholder values across all affected columns and replace "
+                    "them with the literal string N/A wherever the value is missing. Treat blank strings, "
+                    "whitespace-only cells, null, NULL, NA, -, unknown, and other visibly empty placeholders as "
+                    "missing values. Apply the replacement consistently across the dataset, preserve all non-empty "
+                    "valid values as they are, and do not invent or guess any new data beyond converting missing "
+                    "entries to N/A."
                 ),
             )
         )
@@ -63,7 +67,10 @@ def analyze_dataset_deterministically(df: pd.DataFrame) -> DatasetAnalysisPayloa
                     issue_description=f"The dataset contains {duplicate_ratio:.1%} fully duplicated rows.",
                     priority=priority,
                     resolution_prompt=(
-                        "Identify exact duplicate rows and remove redundant copies while keeping one canonical record."
+                        "Identify exact duplicate records across the dataset and remove redundant copies while "
+                        "keeping one canonical version of each repeated row. Preserve legitimate repeated values "
+                        "that are not true duplicates, and avoid merging rows unless all corresponding fields "
+                        "represent the same record."
                     ),
                 )
             )
@@ -78,7 +85,9 @@ def analyze_dataset_deterministically(df: pd.DataFrame) -> DatasetAnalysisPayloa
                 ),
                 priority="Medium",
                 resolution_prompt=(
-                    "Normalize all column headers to lowercase snake_case and trim surrounding whitespace."
+                    "Normalize all column headers consistently across the dataset. Trim surrounding whitespace, "
+                    "remove punctuation noise, convert names to lowercase snake_case, and ensure each header is "
+                    "clear, stable, and unique without changing the meaning of the column."
                 ),
             )
         )
@@ -110,7 +119,9 @@ def analyze_dataset_deterministically(df: pd.DataFrame) -> DatasetAnalysisPayloa
                 ),
                 priority="Medium",
                 resolution_prompt=(
-                    f"Trim leading and trailing whitespace in these columns: {', '.join(whitespace_columns[:6])}."
+                    "Trim leading and trailing whitespace in all affected text fields across the dataset. "
+                    "Preserve meaningful internal spacing unless it is clearly accidental, and ensure values that "
+                    "become empty after trimming are handled consistently as blank or missing data."
                 ),
             )
         )
@@ -124,8 +135,9 @@ def analyze_dataset_deterministically(df: pd.DataFrame) -> DatasetAnalysisPayloa
                 ),
                 priority="Low" if len(inconsistent_case_columns) == 1 else "Medium",
                 resolution_prompt=(
-                    f"Standardize capitalization and spelling for repeated text values in these columns: "
-                    f"{', '.join(inconsistent_case_columns[:6])}."
+                    "Standardize capitalization, spelling, and formatting for repeated text values that represent "
+                    "the same meaning. Apply one canonical form consistently across the dataset while preserving "
+                    "genuinely distinct values and avoiding unsupported corrections."
                 ),
             )
         )

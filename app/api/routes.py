@@ -2,7 +2,7 @@ import os
 import json
 import urllib.error
 import urllib.request
-from fastapi import APIRouter, UploadFile, File, HTTPException, Body
+from fastapi import APIRouter, UploadFile, File, HTTPException, Query
 from fastapi.responses import FileResponse
 from typing import Dict, Any
 
@@ -43,7 +43,11 @@ async def upload_analyze_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/clean-csv/{job_id}", response_model=CleanDataResponse)
-def trigger_cleaning(job_id: str, request: CleanDataRequest):
+def trigger_cleaning(
+    job_id: str,
+    request: CleanDataRequest,
+    download: bool = Query(False, description="Return the cleaned CSV file directly instead of JSON metadata."),
+):
     """
     Run pure AI cleaning pipeline for a job based on a chosen prompt.
     """
@@ -62,6 +66,11 @@ def trigger_cleaning(job_id: str, request: CleanDataRequest):
     try:
         response = clean_csv_with_prompt(job_id, request.prompt)
         JOB_STATUS_DB[job_id]["status"] = "completed"
+        if download:
+            path = os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv")
+            if not os.path.exists(path):
+                raise HTTPException(status_code=404, detail="Cleaned file not found. Ensure job is completed.")
+            return FileResponse(path, media_type="text/csv", filename=f"{job_id}_cleaned.csv")
         return response
     except Exception as e:
         JOB_STATUS_DB[job_id]["status"] = "failed"
