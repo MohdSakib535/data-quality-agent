@@ -10,6 +10,15 @@ app = FastAPI(
     description="A general-purpose AI CSV cleaning agent using FastAPI, LangChain, and Ollama."
 )
 
+@app.on_event("startup")
+async def on_startup():
+    from app.db.session import engine
+    from app.db.base import Base
+    import app.models.cleaned_data
+    import app.models.job
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
 # Allow CORS for potential frontend clients
 app.add_middleware(
     CORSMiddleware,

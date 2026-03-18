@@ -1,13 +1,20 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Dict, Any
+from datetime import datetime
 
 # Job Status Schemas
 class JobResponse(BaseModel):
-    job_id: str = Field(..., description="Unique identifier for the processing job")
+    job_id: str = Field(..., alias="id", description="Unique identifier for the processing job")
     status: str = Field(..., description="Current status of the job")
     filename: Optional[str] = Field(None, description="Original uploaded filename")
     message: Optional[str] = Field(None, description="Additional status message or error detail")
-    output: Optional[Dict[str, Any]] = Field(None, description="Generated output metadata for completed jobs")
+    analysis: Optional[Dict[str, Any]] = Field(None, description="Generated output metadata for completed jobs")
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+    
+    class Config:
+        populate_by_name = True
+        from_attributes = True
 
 class JobListResponse(BaseModel):
     jobs: List[JobResponse] = Field(default_factory=list, description="All tracked jobs")

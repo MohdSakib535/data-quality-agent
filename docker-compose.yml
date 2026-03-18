@@ -6,6 +6,7 @@ services:
     container_name: ai_cleaning_api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
+      DATABASE_URL: postgresql+asyncpg://postgres:admin@host.docker.internal:5432/ai_cleaning_db
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_MODEL: llama3
     ports:

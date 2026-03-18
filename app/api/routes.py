@@ -1,23 +1,36 @@
+import asyncio
 import os
 import json
 import urllib.error
 import urllib.request
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+import pandas as pd
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
-from typing import Dict, Any
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
 
-from app.schemas.models import DatasetAnalysisResponse, CleanDataRequest, CleanDataResponse
+from app.schemas.job import DatasetAnalysisResponse, CleanDataRequest, CleanDataResponse
+from app.models.cleaned_data import CleanedData
+from app.models.job import Job
+from app.db.session import get_db
 from app.services.csv_loader import save_upload_file
 from app.services.pipeline import analyze_csv, clean_csv_with_prompt
 from app.core.config import settings
 
 router = APIRouter()
 
-# In-memory status tracker (for demonstration/starter code, use Redis in production)
-JOB_STATUS_DB: Dict[str, Dict[str, Any]] = {}
+
+async def _ensure_cleaned_output_file(cleaned_result: CleanedData) -> str:
+    path = cleaned_result.cleaned_file_path
+    if os.path.exists(path):
+        return path
+
+    cleaned_df = pd.DataFrame(cleaned_result.cleaned_data)
+    await asyncio.to_thread(cleaned_df.to_csv, path, index=False)
+    return path
 
 @router.post("/upload-analyze-csv", response_model=DatasetAnalysisResponse)
-async def upload_analyze_csv(file: UploadFile = File(...)):
+async def upload_analyze_csv(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
     Upload a CSV file and get an immediate AI-driven data quality analysis and suggestions.
     """
@@ -25,64 +38,86 @@ async def upload_analyze_csv(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Only CSV files are allowed.")
         
     job_id = save_upload_file(file)
-    JOB_STATUS_DB[job_id] = {
-        "job_id": job_id,
-        "status": "analyzing",
-        "filename": file.filename
-    }
+    
+    # Create DB entry
+    db_job = Job(id=job_id, status="analyzing", filename=file.filename)
+    db.add(db_job)
+    await db.commit()
     
     try:
-        # Run synchronous analysis
-        analysis_response = analyze_csv(job_id)
-        JOB_STATUS_DB[job_id]["status"] = "analyzed"
-        JOB_STATUS_DB[job_id]["analysis"] = analysis_response.dict()
+        # Run asynchronous analysis
+        analysis_response = await analyze_csv(job_id)
+        db_job.status = "analyzed"
+        db_job.analysis = analysis_response.model_dump()
+        db_job.quality_score = analysis_response.quality_score
+        await db.commit()
         return analysis_response
     except Exception as e:
-        JOB_STATUS_DB[job_id]["status"] = "failed"
-        JOB_STATUS_DB[job_id]["message"] = str(e)
+        await db.rollback()
+        db_job.status = "failed"
+        db_job.message = str(e)
+        await db.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.post("/clean-csv/{job_id}", response_model=CleanDataResponse)
-def trigger_cleaning(
+async def trigger_cleaning(
     job_id: str,
     request: CleanDataRequest,
-    download: bool = Query(False, description="Return the cleaned CSV file directly instead of JSON metadata."),
+    db: AsyncSession = Depends(get_db)
 ):
     """
     Run pure AI cleaning pipeline for a job based on a chosen prompt.
     """
-    if job_id not in JOB_STATUS_DB:
+    result = await db.execute(select(Job).filter(Job.id == job_id))
+    db_job = result.scalars().first()
+    
+    if not db_job:
         file_path = os.path.join(settings.UPLOAD_DIR, f"{job_id}.csv")
         if not os.path.exists(file_path):
             raise HTTPException(status_code=404, detail="Job ID not found.")
-        JOB_STATUS_DB[job_id] = {
-            "job_id": job_id,
-            "status": "queued",
-            "filename": os.path.basename(file_path),
-        }
+        db_job = Job(id=job_id, status="queued", filename=os.path.basename(file_path))
+        db.add(db_job)
+        await db.commit()
         
-    JOB_STATUS_DB[job_id]["status"] = "processing"
+    db_job.status = "processing"
+    await db.commit()
 
     try:
-        response = clean_csv_with_prompt(job_id, request.prompt)
-        JOB_STATUS_DB[job_id]["status"] = "completed"
-        if download:
-            path = os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv")
-            if not os.path.exists(path):
-                raise HTTPException(status_code=404, detail="Cleaned file not found. Ensure job is completed.")
-            return FileResponse(path, media_type="text/csv", filename=f"{job_id}_cleaned.csv")
+        response = await clean_csv_with_prompt(job_id, request.prompt)
+        cleaned_result = await db.get(CleanedData, job_id)
+
+        if cleaned_result is None:
+            cleaned_result = CleanedData(
+                job_id=job_id,
+                prompt=request.prompt,
+                cleaned_file_path=os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv"),
+                cleaned_data=response.cleaned_data,
+            )
+            db.add(cleaned_result)
+        else:
+            cleaned_result.prompt = request.prompt
+            cleaned_result.cleaned_file_path = os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv")
+            cleaned_result.cleaned_data = response.cleaned_data
+
+        db_job.status = "completed"
+        db_job.message = None
+        await db.commit()
         return response
     except Exception as e:
-        JOB_STATUS_DB[job_id]["status"] = "failed"
-        JOB_STATUS_DB[job_id]["message"] = str(e)
+        await db.rollback()
+        db_job.status = "failed"
+        db_job.message = str(e)
+        await db.commit()
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/download-cleaned/{job_id}")
-async def download_cleaned(job_id: str):
+async def download_cleaned(job_id: str, db: AsyncSession = Depends(get_db)):
     """Download the final cleaned CSV file."""
-    path = os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv")
-    if not os.path.exists(path):
-        raise HTTPException(status_code=404, detail="Cleaned file not found. Ensure job is completed.")
+    cleaned_result = await db.get(CleanedData, job_id)
+    if cleaned_result is None:
+        raise HTTPException(status_code=404, detail="Cleaned data not found. Run cleaning first.")
+
+    path = await _ensure_cleaned_output_file(cleaned_result)
     return FileResponse(path, media_type='text/csv', filename=f"{job_id}_cleaned.csv")
 
 @router.get("/test-ollama")

@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3" # Default model, user can change
     
+    # Database settings
+    DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/ai_cleaning_db"
+    
     # Processing settings
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
     CONFIDENCE_AUTO_ACCEPT: float = 0.95
@@ -24,6 +27,7 @@ class Settings(BaseSettings):
     PHONE_DEFAULT_COUNTRY_CODE: Optional[str] = None
     NORMALIZE_PERCENTAGE_TO_FRACTION: bool = False
     NULL_TOKENS: str = "n/a,na,null,none,-,--,,n.a.,nil,missing,not available,not provided,blank,#n/a,nan,tbd"
+    NULL_OUTPUT_TOKEN: str = "N/A"
     
     class Config:
         env_file = ".env"

@@ -3,7 +3,7 @@ from typing import List
 
 import pandas as pd
 
-from app.schemas.models import DataSuggestion, DatasetAnalysisPayload
+from app.schemas.job import DataSuggestion, DatasetAnalysisPayload
 
 
 def _to_snake_case(value: str) -> str:

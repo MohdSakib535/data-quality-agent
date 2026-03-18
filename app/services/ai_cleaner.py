@@ -4,7 +4,7 @@ from typing import List, Dict, Any
 import pandas as pd
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
 from app.prompts.cleaning_prompts import analysis_prompt_template, clean_data_prompt_template
-from app.schemas.models import DataSuggestion, DatasetAnalysisPayload, DatasetAnalysisResponse
+from app.schemas.job import DataSuggestion, DatasetAnalysisPayload, DatasetAnalysisResponse
 from app.core.config import settings
 from app.services.deterministic_cleaner import (
     analyze_dataset_deterministically,
