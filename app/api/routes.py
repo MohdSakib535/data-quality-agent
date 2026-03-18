@@ -1,9 +1,7 @@
-import asyncio
 import os
 import json
 import urllib.error
 import urllib.request
-import pandas as pd
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -18,16 +16,6 @@ from app.services.pipeline import analyze_csv, clean_csv_with_prompt
 from app.core.config import settings
 
 router = APIRouter()
-
-
-async def _ensure_cleaned_output_file(cleaned_result: CleanedData) -> str:
-    path = cleaned_result.cleaned_file_path
-    if os.path.exists(path):
-        return path
-
-    cleaned_df = pd.DataFrame(cleaned_result.cleaned_data)
-    await asyncio.to_thread(cleaned_df.to_csv, path, index=False)
-    return path
 
 @router.post("/upload-analyze-csv", response_model=DatasetAnalysisResponse)
 async def upload_analyze_csv(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
@@ -117,7 +105,9 @@ async def download_cleaned(job_id: str, db: AsyncSession = Depends(get_db)):
     if cleaned_result is None:
         raise HTTPException(status_code=404, detail="Cleaned data not found. Run cleaning first.")
 
-    path = await _ensure_cleaned_output_file(cleaned_result)
+    path = cleaned_result.cleaned_file_path
+    if not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Cleaned file not found. Run cleaning again.")
     return FileResponse(path, media_type='text/csv', filename=f"{job_id}_cleaned.csv")
 
 @router.get("/test-ollama")

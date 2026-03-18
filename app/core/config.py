@@ -20,6 +20,8 @@ class Settings(BaseSettings):
     
     # Processing settings
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
+    AI_BATCH_SIZE: int = 50
+    CLEAN_PREVIEW_ROWS: int = 25
     CONFIDENCE_AUTO_ACCEPT: float = 0.95
     CONFIDENCE_REVIEW: float = 0.75
     DATE_OUTPUT_FORMAT: str = "%Y-%m-%d"

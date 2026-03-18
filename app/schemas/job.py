@@ -42,7 +42,11 @@ class CleanDataResponse(BaseModel):
     job_id: str = Field(description="The job ID")
     status: str = Field(description="Status of the request (e.g., success, failed)")
     cleaned_file_url: str = Field(description="Endpoint URL to download the cleaned CSV")
+    cleaned_rows: int = Field(
+        default=0,
+        description="Total number of rows written to the cleaned CSV output",
+    )
     cleaned_data: List[Dict[str, Any]] = Field(
         default_factory=list,
-        description="All cleaned rows returned as JSON records",
+        description="Preview rows from the cleaned output; large files are not returned fully in the API response",
     )

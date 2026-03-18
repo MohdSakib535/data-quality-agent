@@ -7,6 +7,7 @@ from app.prompts.cleaning_prompts import analysis_prompt_template, clean_data_pr
 from app.schemas.job import DataSuggestion, DatasetAnalysisPayload, DatasetAnalysisResponse
 from app.core.config import settings
 from app.services.deterministic_cleaner import (
+    _to_snake_case,
     analyze_dataset_deterministically,
 )
 
@@ -229,6 +230,28 @@ def _trim_whitespace_in_string_cells(df: pd.DataFrame) -> pd.DataFrame:
     return trimmed_df
 
 
+def _normalize_missing_tokens(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = df.copy()
+    null_tokens = {
+        token.strip().lower()
+        for token in settings.NULL_TOKENS.split(",")
+        if token.strip()
+    }
+
+    for column in normalized_df.columns:
+        series = normalized_df[column]
+        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
+            normalized_df[column] = series.map(
+                lambda value: (
+                    pd.NA
+                    if isinstance(value, str) and value.strip().lower() in null_tokens
+                    else value
+                )
+            )
+
+    return normalized_df
+
+
 def _should_remove_exact_duplicates(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
 
@@ -257,6 +280,137 @@ def _remove_exact_duplicate_rows(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop_duplicates().reset_index(drop=True)
 
 
+def _remove_exact_duplicate_rows_across_chunks(
+    df: pd.DataFrame,
+    seen_row_hashes: set[int],
+) -> pd.DataFrame:
+    if df.empty:
+        return df
+
+    comparable_df = df.astype(object).where(pd.notnull(df), settings.NULL_OUTPUT_TOKEN)
+    row_hashes = pd.util.hash_pandas_object(comparable_df.astype(str), index=False)
+
+    keep_mask = []
+    local_hashes: set[int] = set()
+
+    for row_hash in row_hashes.tolist():
+        if row_hash in seen_row_hashes or row_hash in local_hashes:
+            keep_mask.append(False)
+            continue
+
+        keep_mask.append(True)
+        local_hashes.add(row_hash)
+
+    seen_row_hashes.update(local_hashes)
+    return df.loc[keep_mask].reset_index(drop=True)
+
+
+def _should_normalize_headers(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    header_terms = [
+        "header",
+        "headers",
+        "column name",
+        "column names",
+        "snake_case",
+    ]
+    return any(term in normalized_prompt for term in header_terms)
+
+
+def _should_trim_whitespace(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    whitespace_terms = [
+        "whitespace",
+        "leading or trailing",
+        "trim",
+        "strip spaces",
+    ]
+    return any(term in normalized_prompt for term in whitespace_terms)
+
+
+def _is_missing_value_only_prompt(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    missing_terms = [
+        "missing",
+        "null",
+        "blank",
+        "empty",
+        "n/a",
+        "placeholder",
+    ]
+    ai_terms = [
+        "standardize spelling",
+        "correct spelling",
+        "category",
+        "map",
+        "capitalize",
+        "capitalization",
+        "typo",
+        "canonical form",
+    ]
+    return any(term in normalized_prompt for term in missing_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
+def _is_duplicate_only_prompt(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    duplicate_terms = [
+        "duplicate",
+        "duplicates",
+        "deduplicate",
+        "dedup",
+        "redundant copies",
+    ]
+    ai_terms = [
+        "standardize spelling",
+        "correct spelling",
+        "category",
+        "map",
+        "capitalize",
+        "capitalization",
+        "typo",
+    ]
+    return any(term in normalized_prompt for term in duplicate_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
+def _requires_ai_cleaning(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    deterministic_only = (
+        _is_duplicate_only_prompt(user_prompt)
+        or _is_missing_value_only_prompt(user_prompt)
+        or _should_normalize_headers(user_prompt)
+        or _should_trim_whitespace(user_prompt)
+    )
+
+    ai_terms = [
+        "standardize",
+        "correct",
+        "fix typo",
+        "normalize values",
+        "map",
+        "category",
+        "categorize",
+        "capitalization",
+        "capitalize",
+        "spelling",
+        "format names",
+    ]
+
+    if any(term in normalized_prompt for term in ai_terms):
+        return True
+
+    return not deterministic_only
+
+
+def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = df.copy()
+    normalized_df.columns = [_to_snake_case(str(column)) for column in normalized_df.columns]
+    return normalized_df
+
+
 def _build_cleaning_chain():
     llm = ChatOllama(
         model=settings.OLLAMA_MODEL,
@@ -264,6 +418,18 @@ def _build_cleaning_chain():
         temperature=0.0,
     )
     return clean_data_prompt_template | llm | StrOutputParser()
+
+
+def build_cleaning_chain():
+    return _build_cleaning_chain()
+
+
+def prompt_requires_ai_cleaning(user_prompt: str) -> bool:
+    return _requires_ai_cleaning(user_prompt)
+
+
+def prompt_removes_exact_duplicates(user_prompt: str) -> bool:
+    return _should_remove_exact_duplicates(user_prompt)
 
 
 def _invoke_cleaning_batch(
@@ -356,34 +522,59 @@ def analyze_dataset(df: pd.DataFrame) -> DatasetAnalysisResponse:
 
 def clean_dataset_with_prompt(df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
     """
-    Iterate through the dataframe in small batches, applying the user's cleaning prompt.
+    Clean a single dataframe chunk using deterministic transforms and, when required,
+    an LLM batch loop.
     """
-    df = _trim_whitespace_in_string_cells(df)
+    return clean_dataframe_chunk(df, user_prompt)
+
+
+def clean_dataframe_chunk(
+    df: pd.DataFrame,
+    user_prompt: str,
+    *,
+    chain=None,
+    seen_row_hashes: set[int] | None = None,
+) -> pd.DataFrame:
+    cleaned_df = _normalize_missing_tokens(df)
+    cleaned_df = _trim_whitespace_in_string_cells(cleaned_df)
+
+    if _should_normalize_headers(user_prompt):
+        cleaned_df = _normalize_headers(cleaned_df)
+
     if _should_remove_exact_duplicates(user_prompt):
-        df = _remove_exact_duplicate_rows(df)
-    chain = _build_cleaning_chain()
-    
-    batch_size = 20
+        if seen_row_hashes is None:
+            cleaned_df = _remove_exact_duplicate_rows(cleaned_df)
+        else:
+            cleaned_df = _remove_exact_duplicate_rows_across_chunks(cleaned_df, seen_row_hashes)
+
+    if cleaned_df.empty or not _requires_ai_cleaning(user_prompt):
+        return cleaned_df
+
+    active_chain = chain or _build_cleaning_chain()
+    batch_size = min(
+        settings.AI_BATCH_SIZE,
+        max(10, 1200 // max(len(cleaned_df.columns), 1)),
+    )
     cleaned_rows = []
-    
+
     # Fill NAs to None for JSON
-    df_clean = df.where(pd.notnull(df), None)
+    df_clean = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
     records = df_clean.to_dict(orient="records")
-    
+
     for i in range(0, len(records), batch_size):
-        batch = records[i:i+batch_size]
+        batch = records[i:i + batch_size]
         batch_json = json.dumps(batch, indent=2)
-        
+
         try:
             cleaned_batch = _invoke_cleaning_batch(
-                chain=chain,
+                chain=active_chain,
                 batch_json=batch_json,
                 user_prompt=user_prompt,
                 expected_rows=len(batch),
             )
             cleaned_rows.extend(cleaned_batch)
         except Exception as e:
-            print(f"Error cleaning batch {i} to {i+batch_size}: {e}")
+            print(f"Error cleaning batch {i} to {i + batch_size}: {e}")
             cleaned_rows.extend(batch)
-            
+
     return pd.DataFrame(cleaned_rows)
