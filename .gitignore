@@ -9,3 +9,8 @@ __pycache__
 .pytest_cache
 .mypy_cache
 app/storage
+*.idea
+.DS_Store
+*.log
+*.bak
+*.tmp
