@@ -14,6 +14,8 @@ class Settings(BaseSettings):
     # LLM Settings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "llama3" # Default model, user can change
+    OLLAMA_HOST: Optional[str] = None
+    OLLAMA_TIMEOUT: int = 30
     
     # Database settings
     DATABASE_URL: str = "postgresql+asyncpg://postgres:admin@localhost:5432/ai_cleaning_db"
@@ -30,6 +32,10 @@ class Settings(BaseSettings):
     NORMALIZE_PERCENTAGE_TO_FRACTION: bool = False
     NULL_TOKENS: str = "n/a,na,null,none,-,--,,n.a.,nil,missing,not available,not provided,blank,#n/a,nan,tbd"
     NULL_OUTPUT_TOKEN: str = "N/A"
+    CHAT_MAX_ROWS: int = 500
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
+    REDIS_DB: int = 0
     
     class Config:
         env_file = ".env"
