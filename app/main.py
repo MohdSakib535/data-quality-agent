@@ -1,44 +1,84 @@
+"""
+FastAPI application factory.
+Registers middleware, routers, and startup/shutdown hooks.
+"""
+import logging
+import sys
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import router
-from app.routers.chat_with_data import router as chat_router
+
 from app.core.config import settings
-import uvicorn
+from app.api.middleware import setup_middleware
+from app.api.routers import datasets, jobs, queries
+from app.db.session import async_engine
+from app.db.base import Base
+import app.models.dataset  # noqa: F401
+import app.models.query  # noqa: F401
 
-app = FastAPI(
-    title=settings.PROJECT_NAME,
-    version=settings.VERSION,
-    description="A general-purpose AI CSV cleaning agent using FastAPI, LangChain, and Ollama."
+# ── Structured logging ───────────────────────────────────────
+logging.basicConfig(
+    level=logging.DEBUG if settings.DEBUG else logging.INFO,
+    format='{"time":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","message":"%(message)s"}',
+    stream=sys.stdout,
 )
+logger = logging.getLogger(__name__)
 
-@app.on_event("startup")
-async def on_startup():
-    from app.db.session import engine
-    from app.db.base import Base
-    import app.models.cleaned_data
-    import app.models.job
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
 
-# Allow CORS for potential frontend clients
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+def create_app() -> FastAPI:
+    """Create and configure the FastAPI application."""
+    application = FastAPI(
+        title=settings.PROJECT_NAME,
+        version=settings.VERSION,
+        description="Production-grade dataset intelligence platform: upload, analyze, clean, and query datasets using NL→SQL.",
+        docs_url="/docs",
+        redoc_url="/redoc",
+    )
 
-# Include the endpoints router
-app.include_router(router, prefix="/api/v1")
-app.include_router(chat_router)
+    # CORS
+    application.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
 
-@app.get("/")
-def read_root():
-    return {
-        "message": f"Welcome to the {settings.PROJECT_NAME} API",
-        "docs_url": "/docs"
-    }
+    # Custom middleware
+    setup_middleware(application)
 
-if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True)
+    # Routers
+    application.include_router(datasets.router)
+    application.include_router(jobs.router)
+    application.include_router(queries.router)
+
+    @application.on_event("startup")
+    async def on_startup():
+        # Auto-create tables on startup (idempotent)
+        async with async_engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        logger.info("Application starting up", extra={"version": settings.VERSION})
+
+    @application.on_event("shutdown")
+    async def on_shutdown():
+        from app.db.session import async_engine
+        await async_engine.dispose()
+        logger.info("Application shut down")
+
+    @application.get("/", tags=["health"])
+    async def root():
+        return {
+            "service": settings.PROJECT_NAME,
+            "version": settings.VERSION,
+            "status": "healthy",
+            "docs": "/docs",
+        }
+
+    @application.get("/health", tags=["health"])
+    async def health():
+        return {"status": "ok"}
+
+    return application
+
+
+app = create_app()
