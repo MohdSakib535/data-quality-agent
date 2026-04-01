@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     
     # LLM Settings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "llama3" # Default model, user can change
+    OLLAMA_MODEL: str = "qwen2.5-coder" # Default model, user can change
     OLLAMA_HOST: Optional[str] = None
     OLLAMA_TIMEOUT: int = 30
     
@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Processing settings
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
     AI_BATCH_SIZE: int = 50
+    ANALYSIS_SAMPLE_ROWS: int = 5000
     CLEAN_PREVIEW_ROWS: int = 25
     CONFIDENCE_AUTO_ACCEPT: float = 0.95
     CONFIDENCE_REVIEW: float = 0.75
@@ -33,6 +34,8 @@ class Settings(BaseSettings):
     NULL_TOKENS: str = "n/a,na,null,none,-,--,,n.a.,nil,missing,not available,not provided,blank,#n/a,nan,tbd"
     NULL_OUTPUT_TOKEN: str = "N/A"
     CHAT_MAX_ROWS: int = 500
+    SEMANTIC_TOP_COLUMNS: int = 12
+    SEMANTIC_ROW_SAMPLE_LIMIT: int = 200
     REDIS_HOST: str = "localhost"
     REDIS_PORT: int = 6379
     REDIS_DB: int = 0

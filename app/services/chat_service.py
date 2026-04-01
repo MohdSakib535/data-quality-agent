@@ -12,6 +12,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal, engine
 from app.models.chat_history import ChatHistory
+from app.services.semantic_layer import format_semantic_context_for_prompt
 from app.utils.chat_utils import (
     OllamaResponseError,
     OllamaUnavailableError,
@@ -110,6 +111,28 @@ def _infer_value_type(value: Any) -> str:
 
 
 async def get_cleaned_data_row_schema(job_id: str, sample_items: int = 200) -> list[dict]:
+    records = await get_cleaned_data_row_samples(job_id=job_id, sample_items=sample_items)
+    if not records:
+        return []
+
+    field_types: dict[str, set[str]] = {}
+    for record in records:
+        for key, value in record.items():
+            inferred = _infer_value_type(value)
+            if key not in field_types:
+                field_types[key] = set()
+            field_types[key].add(inferred)
+
+    return [
+        {"column_name": key, "data_type": "/".join(sorted(types))}
+        for key, types in sorted(field_types.items(), key=lambda item: item[0])
+    ]
+
+
+async def get_cleaned_data_row_samples(
+    job_id: str,
+    sample_items: int = 200,
+) -> list[dict[str, Any]]:
     query = text(
         """
         SELECT cleaned_data
@@ -143,18 +166,7 @@ async def get_cleaned_data_row_schema(job_id: str, sample_items: int = 200) -> l
     else:
         return []
 
-    field_types: dict[str, set[str]] = {}
-    for record in records:
-        for key, value in record.items():
-            inferred = _infer_value_type(value)
-            if key not in field_types:
-                field_types[key] = set()
-            field_types[key].add(inferred)
-
-    return [
-        {"column_name": key, "data_type": "/".join(sorted(types))}
-        for key, types in sorted(field_types.items(), key=lambda item: item[0])
-    ]
+    return records
 
 
 def _extract_select_expressions(sql: str) -> list[str]:
@@ -277,11 +289,15 @@ def build_prompt(
     schema: list[dict],
     table_name: str,
     row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+    query_plan: dict[str, Any] | None = None,
 ) -> str:
     columns = "\n".join(
         f"- {column['column_name']} ({column['data_type']})"
         for column in schema
     )
+    semantic_hints = format_semantic_context_for_prompt(semantic_context or [])
+    plan_json = json.dumps(query_plan or {}, ensure_ascii=True)
 
     extra_rules = ""
     if table_name == "cleaned_data":
@@ -315,11 +331,17 @@ Table: {table_name}
 Columns:
 {columns}
 {extra_rules}
+Top semantic hints for this question:
+{semantic_hints or "- none"}
+
+Structured query plan from a previous planning step (JSON):
+{plan_json}
 
 Rules:
 - Return ONLY raw SQL, no explanation, no markdown, no backticks
 - Only SELECT statements
 - Use exact column names listed above
+- Use semantic hints to map user language to actual columns
 - Add explicit aliases for every selected expression using AS
 - Add LIMIT 100 unless question asks for specific count
 - If columns are insufficient write:
@@ -331,12 +353,105 @@ SQL:
 """
 
 
+def build_query_plan_prompt(
+    question: str,
+    schema: list[dict],
+    table_name: str,
+    row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+) -> str:
+    columns = "\n".join(
+        f"- {column['column_name']} ({column['data_type']})"
+        for column in schema
+    )
+    json_columns = "\n".join(
+        f"- {column['column_name']} ({column['data_type']})"
+        for column in (row_schema or [])
+    )
+    semantic_hints = format_semantic_context_for_prompt(semantic_context or [])
+
+    return f"""You are an expert analytics planner for PostgreSQL questions.
+
+Question:
+{question}
+
+Table:
+{table_name}
+
+Table columns:
+{columns}
+
+JSON row fields (if present):
+{json_columns or "- none"}
+
+Semantic hints:
+{semantic_hints or "- none"}
+
+Return ONLY valid JSON with this shape:
+{{
+  "intent": "short sentence",
+  "metrics": ["..."],
+  "dimensions": ["..."],
+  "filters": ["..."],
+  "time_range": "string or null",
+  "required_columns": ["actual column names or JSON fields"],
+  "optional_columns": ["..."],
+  "ambiguity_notes": ["..."],
+  "needs_clarification": false,
+  "clarification_question": null,
+  "confidence": 0.0
+}}
+
+Rules:
+- Use only available table columns and JSON row fields
+- If user terms are implicit, map them to likely columns via semantic hints
+- Keep confidence between 0 and 1
+- needs_clarification should be true only if intent cannot be resolved
+"""
+
+
+def _extract_json_payload(raw_response: str) -> Any:
+    candidates: list[str] = []
+    fenced_json_match = re.search(r"```json\s*(.*?)```", raw_response, re.DOTALL | re.IGNORECASE)
+    if fenced_json_match:
+        candidates.append(fenced_json_match.group(1).strip())
+
+    fenced_match = re.search(r"```\s*(.*?)```", raw_response, re.DOTALL)
+    if fenced_match:
+        candidates.append(fenced_match.group(1).strip())
+
+    candidates.append(raw_response.strip())
+
+    array_match = re.search(r"(\[\s*.*\s*\])", raw_response, re.DOTALL)
+    if array_match:
+        candidates.append(array_match.group(1).strip())
+
+    object_match = re.search(r"(\{\s*.*\s*\})", raw_response, re.DOTALL)
+    if object_match:
+        candidates.append(object_match.group(1).strip())
+
+    for candidate in candidates:
+        try:
+            return json.loads(candidate)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+    raise OllamaResponseError("Ollama did not return valid JSON.")
+
+
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(min=1, max=4),
     reraise=True,
 )
-async def _call_ollama(prompt: str) -> str:
+async def _call_ollama_raw(prompt: str) -> str:
     ollama_host = resolve_ollama_host()
     ollama_model = settings.OLLAMA_MODEL
     ollama_timeout = float(settings.OLLAMA_TIMEOUT)
@@ -363,14 +478,21 @@ async def _call_ollama(prompt: str) -> str:
         raise OllamaResponseError("Ollama returned an invalid response.")
 
     try:
-        raw_sql = response.json()["response"]
+        raw_response = response.json()["response"]
     except (ValueError, KeyError, TypeError) as exc:
         raise OllamaResponseError("Invalid Ollama response format.") from exc
 
-    sql = clean_sql_response(raw_sql)
+    if not raw_response or not isinstance(raw_response, str):
+        raise OllamaResponseError("Ollama did not return a usable response.")
+
+    return raw_response
+
+
+async def _call_ollama(prompt: str) -> str:
+    raw_response = await _call_ollama_raw(prompt)
+    sql = clean_sql_response(raw_response)
     if not sql:
         raise OllamaResponseError("Ollama did not return SQL.")
-
     return sql
 
 
@@ -379,9 +501,58 @@ async def generate_sql_via_ollama(
     schema: list[dict],
     table_name: str,
     row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+    query_plan: dict[str, Any] | None = None,
 ) -> str:
-    prompt = build_prompt(question, schema, table_name, row_schema=row_schema)
+    prompt = build_prompt(
+        question,
+        schema,
+        table_name,
+        row_schema=row_schema,
+        semantic_context=semantic_context,
+        query_plan=query_plan,
+    )
     return await _call_ollama(prompt)
+
+
+async def plan_query_via_ollama(
+    question: str,
+    schema: list[dict],
+    table_name: str,
+    row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    prompt = build_query_plan_prompt(
+        question=question,
+        schema=schema,
+        table_name=table_name,
+        row_schema=row_schema,
+        semantic_context=semantic_context,
+    )
+    raw_response = await _call_ollama_raw(prompt)
+    payload = _extract_json_payload(raw_response)
+    if not isinstance(payload, dict):
+        raise OllamaResponseError("Query planner did not return a JSON object.")
+
+    return {
+        "intent": str(payload.get("intent", "")).strip(),
+        "metrics": payload.get("metrics", []) if isinstance(payload.get("metrics"), list) else [],
+        "dimensions": payload.get("dimensions", []) if isinstance(payload.get("dimensions"), list) else [],
+        "filters": payload.get("filters", []) if isinstance(payload.get("filters"), list) else [],
+        "time_range": payload.get("time_range"),
+        "required_columns": payload.get("required_columns", [])
+        if isinstance(payload.get("required_columns"), list)
+        else [],
+        "optional_columns": payload.get("optional_columns", [])
+        if isinstance(payload.get("optional_columns"), list)
+        else [],
+        "ambiguity_notes": payload.get("ambiguity_notes", [])
+        if isinstance(payload.get("ambiguity_notes"), list)
+        else [],
+        "needs_clarification": bool(payload.get("needs_clarification", False)),
+        "clarification_question": payload.get("clarification_question"),
+        "confidence": _as_float(payload.get("confidence", 0.0), default=0.0),
+    }
 
 
 def build_repair_prompt(
@@ -391,6 +562,8 @@ def build_repair_prompt(
     failed_sql: str,
     db_error: str,
     row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+    query_plan: dict[str, Any] | None = None,
 ) -> str:
     columns = "\n".join(
         f"- {column['column_name']} ({column['data_type']})"
@@ -414,6 +587,8 @@ For cleaned_data table:
 Detected JSON row fields:
 {detected}
 """
+    semantic_hints = format_semantic_context_for_prompt(semantic_context or [])
+    plan_json = json.dumps(query_plan or {}, ensure_ascii=True)
 
     return f"""You are a PostgreSQL expert. Fix this SQL query.
 
@@ -421,6 +596,11 @@ Table: {table_name}
 Columns:
 {columns}
 {json_rules}
+Semantic hints:
+{semantic_hints or "- none"}
+
+Structured query plan (JSON):
+{plan_json}
 
 Original question:
 {question}
@@ -450,6 +630,8 @@ async def repair_sql_via_ollama(
     failed_sql: str,
     db_error: str,
     row_schema: list[dict] | None = None,
+    semantic_context: list[dict[str, Any]] | None = None,
+    query_plan: dict[str, Any] | None = None,
 ) -> str:
     prompt = build_repair_prompt(
         question,
@@ -458,6 +640,8 @@ async def repair_sql_via_ollama(
         failed_sql,
         db_error,
         row_schema=row_schema,
+        semantic_context=semantic_context,
+        query_plan=query_plan,
     )
     return await _call_ollama(prompt)
 
@@ -482,6 +666,11 @@ async def safe_execute(conn: AsyncConnection, sql: str, max_rows: int = 500) -> 
             }
         )
     return payload
+
+
+async def explain_query(conn: AsyncConnection, sql: str) -> None:
+    normalized_sql = sql.strip().rstrip(";")
+    await conn.execute(text(f"EXPLAIN {normalized_sql}"))
 
 
 async def save_chat_history(

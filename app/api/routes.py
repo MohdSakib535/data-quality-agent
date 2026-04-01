@@ -1,7 +1,10 @@
 import os
 import json
+import logging
 import urllib.error
 import urllib.request
+
+import httpx
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,21 +14,39 @@ from app.schemas.job import DatasetAnalysisResponse, CleanDataRequest, CleanData
 from app.models.cleaned_data import CleanedData
 from app.models.job import Job
 from app.db.session import get_db
-from app.services.csv_loader import save_upload_file
+from app.services.csv_loader import (
+    SUPPORTED_UPLOAD_EXTENSIONS,
+    is_supported_upload_file,
+    save_upload_file,
+)
 from app.services.pipeline import analyze_csv, clean_csv_with_prompt
+from app.services.chat_service import (
+    get_cleaned_data_row_samples,
+    get_cleaned_data_row_schema,
+    get_table_schema,
+)
+from app.services.semantic_layer import ensure_semantic_metadata
 from app.core.config import settings
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 @router.post("/upload-analyze-csv", response_model=DatasetAnalysisResponse)
 async def upload_analyze_csv(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
-    Upload a CSV file and get an immediate AI-driven data quality analysis and suggestions.
+    Upload a CSV/Excel file and get an immediate AI-driven data quality analysis and suggestions.
     """
-    if not file.filename.endswith('.csv'):
-        raise HTTPException(status_code=400, detail="Only CSV files are allowed.")
-        
-    job_id = save_upload_file(file)
+    if not is_supported_upload_file(file):
+        supported_extensions = ", ".join(sorted(SUPPORTED_UPLOAD_EXTENSIONS))
+        raise HTTPException(
+            status_code=400,
+            detail=f"Only CSV or Excel files are allowed ({supported_extensions}).",
+        )
+
+    try:
+        job_id = save_upload_file(file)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     
     # Create DB entry
     db_job = Job(id=job_id, status="analyzing", filename=file.filename)
@@ -90,6 +111,25 @@ async def trigger_cleaning(
         db_job.status = "completed"
         db_job.message = None
         await db.commit()
+
+        try:
+            table_schema = await get_table_schema("cleaned_data")
+            row_schema = await get_cleaned_data_row_schema(job_id)
+            row_samples = await get_cleaned_data_row_samples(
+                job_id,
+                sample_items=settings.SEMANTIC_ROW_SAMPLE_LIMIT,
+            )
+            await ensure_semantic_metadata(
+                job_id=job_id,
+                table_name="cleaned_data",
+                table_schema=table_schema,
+                row_schema=row_schema,
+                row_samples=row_samples,
+            )
+        except Exception:
+            # Metadata enrichment is best effort; cleaning should still succeed.
+            logger.exception("Failed to build semantic metadata for job_id=%s", job_id)
+
         return response
     except Exception as e:
         await db.rollback()
@@ -112,7 +152,10 @@ async def download_cleaned(job_id: str, db: AsyncSession = Depends(get_db)):
 
 @router.get("/test-ollama")
 async def test_ollama_connection(prompt: str = "Reply with a short health check message."):
-    """Verify Ollama is reachable."""
+    """
+    Verify Ollama is reachable and optionally return a small LLM reply for the given prompt.
+    Echoes the provided prompt so callers can confirm which topic they sent.
+    """
     tags_url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/tags"
 
     try:
@@ -132,10 +175,13 @@ async def test_ollama_connection(prompt: str = "Reply with a short health check 
 
     models = payload.get("models", [])
     available_models = [model.get("name", "") for model in models]
-    model_found = any(
-        model_name == settings.OLLAMA_MODEL or model_name.startswith(f"{settings.OLLAMA_MODEL}:")
+    matching_models = [
+        model_name
         for model_name in available_models
-    )
+        if model_name == settings.OLLAMA_MODEL or model_name.startswith(f"{settings.OLLAMA_MODEL}:")
+    ]
+    model_found = bool(matching_models)
+    generate_model = matching_models[0] if matching_models else settings.OLLAMA_MODEL
 
     if not model_found:
         return {
@@ -144,14 +190,39 @@ async def test_ollama_connection(prompt: str = "Reply with a short health check 
             "model": settings.OLLAMA_MODEL,
             "model_found": False,
             "available_models": available_models,
+            "prompt": prompt,
             "message": "Ollama is reachable, but the configured model was not found.",
         }
+
+    # Try a short generation so callers can see an actual model reply.
+    model_reply = None
+    model_error = None
+    try:
+        generate_url = f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate"
+        payload = {
+            "model": generate_model,
+            "prompt": prompt,
+            "stream": False,
+        }
+        async with httpx.AsyncClient(timeout=settings.OLLAMA_TIMEOUT) as client:
+            resp = await client.post(generate_url, json=payload)
+            resp.raise_for_status()
+            body = resp.json()
+            # Ollama returns the text under "response"
+            model_reply = body.get("response")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ollama generate failed during health check: %s", exc)
+        model_error = str(exc)
 
     return {
         "ok": True,
         "base_url": settings.OLLAMA_BASE_URL,
         "model": settings.OLLAMA_MODEL,
+        "model_used": generate_model,
         "model_found": True,
         "available_models": available_models,
-        "message": "Ollama is reachable and generation succeeded.",
+        "prompt": prompt,
+        "model_reply": model_reply,
+        "model_error": model_error,
+        "message": "Ollama is reachable and generation succeeded." if model_reply is not None else "Ollama is reachable (generation skipped or failed).",
     }

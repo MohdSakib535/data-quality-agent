@@ -4,11 +4,56 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from app.services.ai_cleaner import clean_dataset_with_prompt
+from app.services.ai_cleaner import (
+    _extract_json_payload,
+    _invoke_cleaning_batch_with_fallback,
+    clean_dataframe_chunk,
+    clean_dataset_with_prompt,
+)
 
 
 class CleanDatasetWithPromptTests(unittest.TestCase):
-    def test_trims_string_cells_before_prompt_cleaning(self):
+    def test_extract_json_payload_accepts_python_literal_style_response(self):
+        raw = """```json
+        [{'name': 'Alice', 'active': True, 'notes': None}]
+        ```"""
+        payload = _extract_json_payload(raw)
+        self.assertEqual(payload, [{"name": "Alice", "active": True, "notes": None}])
+
+    def test_invoke_cleaning_batch_with_fallback_splits_failed_batch(self):
+        rows = [{"city": "mumbai"}, {"city": "delhi"}]
+
+        def flaky_invoke(chain, batch_json, user_prompt, expected_rows):
+            if expected_rows > 1:
+                raise ValueError("non-json response")
+            single = json.loads(batch_json)[0]
+            return [{"city": single["city"].title()}]
+
+        with patch("app.services.ai_cleaner._invoke_cleaning_batch", side_effect=flaky_invoke):
+            cleaned = _invoke_cleaning_batch_with_fallback(
+                chain="fake-chain",
+                batch_records=rows,
+                user_prompt="Standardize capitalization for city values.",
+            )
+
+        self.assertEqual(cleaned, [{"city": "Mumbai"}, {"city": "Delhi"}])
+
+    def test_invoke_cleaning_batch_with_fallback_keeps_rows_when_model_keeps_mismatching(self):
+        rows = [{"city": "mumbai"}, {"city": "delhi"}]
+
+        with patch(
+            "app.services.ai_cleaner._invoke_cleaning_batch",
+            side_effect=ValueError("Batch size mismatch. Expected 2, got 6"),
+        ):
+            cleaned = _invoke_cleaning_batch_with_fallback(
+                chain="fake-chain",
+                batch_records=rows,
+                user_prompt="Standardize capitalization for city values.",
+            )
+
+        self.assertEqual(cleaned, rows)
+
+    def test_trims_string_cells_when_prompt_requests_whitespace_cleanup(self):
         source_df = pd.DataFrame(
             [
                 {"name": "  Alice  ", "title": " Engineer ", "score": 10},
@@ -16,36 +61,22 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
                 {"name": None, "title": "Manager", "score": 30},
             ]
         )
-        captured_batches = []
 
-        def fake_invoke_cleaning_batch(chain, batch_json, user_prompt, expected_rows):
-            self.assertEqual(chain, "fake-chain")
-            self.assertEqual(user_prompt, "normalize titles")
-            self.assertEqual(expected_rows, 3)
+        cleaned_df = clean_dataset_with_prompt(
+            source_df,
+            "Trim leading or trailing whitespace in all affected text fields.",
+        )
 
-            rows = json.loads(batch_json)
-            captured_batches.append(rows)
-            return rows
-
-        with patch("app.services.ai_cleaner._build_cleaning_chain", return_value="fake-chain"):
-            with patch(
-                "app.services.ai_cleaner._invoke_cleaning_batch",
-                side_effect=fake_invoke_cleaning_batch,
-            ):
-                cleaned_df = clean_dataset_with_prompt(source_df, "normalize titles")
-
-        self.assertEqual(len(captured_batches), 1)
         self.assertEqual(
-            captured_batches[0],
+            cleaned_df.to_dict(orient="records"),
             [
                 {"name": "Alice", "title": "Engineer", "score": 10},
                 {"name": "Bob", "title": "", "score": 20},
                 {"name": None, "title": "Manager", "score": 30},
             ],
         )
-        self.assertEqual(cleaned_df.to_dict(orient="records"), captured_batches[0])
 
-    def test_removes_exact_duplicate_rows_before_prompt_cleaning(self):
+    def test_duplicate_only_prompt_preserves_non_requested_fields(self):
         source_df = pd.DataFrame(
             [
                 {
@@ -54,7 +85,7 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
                     "Phone Number": "9876543210",
                     "City": "Delhi",
                     "Join Date": "01/02/2025",
-                    "Amount / Score": "₹12,500",
+                    "Amount / Score": "  ₹12,500  ",
                     "Status": "Paid",
                     "Job Title": "ui ux desginer",
                 },
@@ -64,7 +95,7 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
                     "Phone Number": "9876543210",
                     "City": "Delhi",
                     "Join Date": "01/02/2025",
-                    "Amount / Score": "₹12,500",
+                    "Amount / Score": "  ₹12,500  ",
                     "Status": "Paid",
                     "Job Title": "ui ux desginer",
                 },
@@ -76,40 +107,69 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
             "that are not true duplicates, and avoid merging rows unless all corresponding fields "
             "represent the same record."
         )
-        captured_batches = []
+        cleaned_df = clean_dataset_with_prompt(source_df, prompt)
+
+        self.assertEqual(len(cleaned_df), 1)
+        self.assertEqual(cleaned_df.iloc[0]["Amount / Score"], "  ₹12,500  ")
+
+    def test_ai_cleaning_updates_only_prompt_target_columns(self):
+        source_df = pd.DataFrame(
+            [
+                {"name": "Alice", "job_title": "ui ux desginer"},
+                {"name": "Bob", "job_title": "Sr. Engneer"},
+            ]
+        )
+        seen_batch_rows = []
 
         def fake_invoke_cleaning_batch(chain, batch_json, user_prompt, expected_rows):
-            self.assertEqual(chain, "fake-chain")
-            self.assertEqual(user_prompt, prompt)
-            self.assertEqual(expected_rows, 1)
-
             rows = json.loads(batch_json)
-            captured_batches.append(rows)
-            return rows
+            seen_batch_rows.extend(rows)
+            updated_rows = []
+            for row in rows:
+                self.assertNotIn("name", row)
+                updated_rows.append(
+                    {
+                        "name": "SHOULD_NOT_BE_APPLIED",
+                        "job_title": row["job_title"].replace("desginer", "designer").replace("Engneer", "Engineer"),
+                    }
+                )
+            return updated_rows
 
-        with patch("app.services.ai_cleaner._build_cleaning_chain", return_value="fake-chain"):
-            with patch(
-                "app.services.ai_cleaner._invoke_cleaning_batch",
-                side_effect=fake_invoke_cleaning_batch,
-            ):
-                cleaned_df = clean_dataset_with_prompt(source_df, prompt)
+        with patch("app.services.ai_cleaner._invoke_cleaning_batch", side_effect=fake_invoke_cleaning_batch):
+            cleaned_df = clean_dataframe_chunk(
+                source_df,
+                "Standardize spelling in job_title column.",
+                chain="fake-chain",
+            )
 
-        self.assertEqual(
-            captured_batches[0],
+        self.assertTrue(all(set(row.keys()) == {"job_title"} for row in seen_batch_rows))
+        self.assertEqual(cleaned_df["name"].tolist(), ["Alice", "Bob"])
+        self.assertEqual(cleaned_df["job_title"].tolist(), ["ui ux designer", "Sr. Engineer"])
+
+    def test_ai_cleaning_reuses_duplicate_rows_within_chunk(self):
+        source_df = pd.DataFrame(
             [
-                {
-                    " Full Name ": "John Doe",
-                    "Email Address": "john.doe@example.com",
-                    "Phone Number": "9876543210",
-                    "City": "Delhi",
-                    "Join Date": "01/02/2025",
-                    "Amount / Score": "₹12,500",
-                    "Status": "Paid",
-                    "Job Title": "ui ux desginer",
-                }
-            ],
+                {"city": "mumbai"},
+                {"city": "mumbai"},
+                {"city": "delhi"},
+            ]
         )
-        self.assertEqual(len(cleaned_df), 1)
+        expected_batch_sizes = []
+
+        def fake_invoke_cleaning_batch(chain, batch_json, user_prompt, expected_rows):
+            expected_batch_sizes.append(expected_rows)
+            rows = json.loads(batch_json)
+            return [{"city": row["city"].title()} for row in rows]
+
+        with patch("app.services.ai_cleaner._invoke_cleaning_batch", side_effect=fake_invoke_cleaning_batch):
+            cleaned_df = clean_dataframe_chunk(
+                source_df,
+                "Standardize capitalization for city values.",
+                chain="fake-chain",
+            )
+
+        self.assertEqual(expected_batch_sizes, [2])
+        self.assertEqual(cleaned_df["city"].tolist(), ["Mumbai", "Mumbai", "Delhi"])
 
 
 if __name__ == "__main__":

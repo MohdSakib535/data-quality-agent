@@ -14,13 +14,21 @@ from app.core.config import settings
 from app.db.session import engine, get_db
 from app.models.chat_history import ChatHistory
 from app.services.chat_service import (
+    explain_query,
     generate_sql_via_ollama,
+    get_cleaned_data_row_samples,
     get_cleaned_data_row_schema,
     get_table_schema,
+    plan_query_via_ollama,
     repair_sql_via_ollama,
     resolve_ollama_host,
     safe_execute,
     save_chat_history,
+)
+from app.services.semantic_layer import (
+    ensure_semantic_metadata,
+    retrieve_relevant_semantic_context,
+    semantic_metadata_exists,
 )
 from app.utils.chat_utils import (
     JobNotFoundError,
@@ -149,23 +157,89 @@ async def chat_query(request: ChatQueryRequest):
     schema = await get_table_schema(table_name)
     if not schema:
         raise HTTPException(status_code=400, detail="Table schema is empty.")
-    row_schema = (
-        await get_cleaned_data_row_schema(job_id)
-        if table_name == "cleaned_data"
-        else []
+    row_schema: list[dict[str, str]] = []
+    row_samples: list[dict[str, Any]] = []
+    if table_name == "cleaned_data":
+        row_schema = await get_cleaned_data_row_schema(job_id)
+        row_samples = await get_cleaned_data_row_samples(
+            job_id,
+            sample_items=settings.SEMANTIC_ROW_SAMPLE_LIMIT,
+        )
+
+    if not await semantic_metadata_exists(job_id=job_id, table_name=table_name):
+        await ensure_semantic_metadata(
+            job_id=job_id,
+            table_name=table_name,
+            table_schema=schema,
+            row_schema=row_schema,
+            row_samples=row_samples,
+        )
+    semantic_context = await retrieve_relevant_semantic_context(
+        job_id=job_id,
+        table_name=table_name,
+        question=question,
+        limit=settings.SEMANTIC_TOP_COLUMNS,
     )
 
     sql_generated = ""
+    query_plan: dict[str, Any] = {}
     try:
         scoped_question = (
             f"{question}\n\n"
             f"Only return rows for job_id = '{job_id}'."
         )
+        try:
+            query_plan = await plan_query_via_ollama(
+                scoped_question,
+                schema,
+                table_name,
+                row_schema=row_schema,
+                semantic_context=semantic_context,
+            )
+        except OllamaResponseError:
+            logger.warning(
+                "Planner returned non-JSON payload for job_id=%s; continuing without plan.",
+                job_id,
+            )
+            query_plan = {}
+
+        confidence_raw = query_plan.get("confidence", 0.0)
+        try:
+            planner_confidence = float(confidence_raw or 0.0)
+        except (TypeError, ValueError):
+            planner_confidence = 0.0
+
+        if (
+            query_plan.get("needs_clarification")
+            and query_plan.get("clarification_question")
+            and planner_confidence < 0.45
+        ):
+            clarification = str(query_plan["clarification_question"])
+            asyncio.create_task(
+                save_chat_history(
+                    job_id=job_id,
+                    question=question,
+                    sql_generated="",
+                    row_count=0,
+                    success=False,
+                    error_message=f"Need clarification: {clarification}",
+                )
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": "Need clarification to answer this question accurately.",
+                    "clarification_question": clarification,
+                },
+            )
+
         sql_generated = await generate_sql_via_ollama(
             scoped_question,
             schema,
             table_name,
             row_schema=row_schema,
+            semantic_context=semantic_context,
+            query_plan=query_plan,
         )
     except OllamaUnavailableError:
         asyncio.create_task(
@@ -223,6 +297,8 @@ async def chat_query(request: ChatQueryRequest):
                     "Top-level cleaned_data row query is not sufficient."
                 ),
                 row_schema=row_schema,
+                semantic_context=semantic_context,
+                query_plan=query_plan,
             )
             is_repaired_valid, repaired_reason = validate_sql(repaired_sql)
             if not is_repaired_valid:
@@ -246,6 +322,7 @@ async def chat_query(request: ChatQueryRequest):
 
     try:
         async with engine.connect() as conn:
+            await explain_query(conn, sql_generated)
             data = await safe_execute(conn, sql_generated, max_rows=max_rows)
     except Exception as exec_error:
         logger.exception("Failed SQL execution for job_id=%s", job_id)
@@ -258,6 +335,8 @@ async def chat_query(request: ChatQueryRequest):
                 failed_sql=sql_generated,
                 db_error=str(exec_error),
                 row_schema=row_schema,
+                semantic_context=semantic_context,
+                query_plan=query_plan,
             )
             is_repaired_valid, repaired_reason = validate_sql(repaired_sql)
             if not is_repaired_valid:
@@ -265,6 +344,7 @@ async def chat_query(request: ChatQueryRequest):
 
             repaired_sql = _ensure_job_filter(repaired_sql, job_id)
             async with engine.connect() as conn:
+                await explain_query(conn, repaired_sql)
                 data = await safe_execute(conn, repaired_sql, max_rows=max_rows)
             sql_generated = repaired_sql
         except Exception:

@@ -1,5 +1,6 @@
 import json
 import re
+import ast
 from typing import List, Dict, Any
 import pandas as pd
 from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
@@ -15,6 +16,15 @@ try:
     from langchain_ollama import ChatOllama
 except ImportError:
     from langchain_community.chat_models import ChatOllama
+
+
+def _coerce_python_payload(candidate: str) -> Any:
+    """Best-effort parsing for python-like payloads (single quotes, True/False/None)."""
+    payload = ast.literal_eval(candidate)
+    if isinstance(payload, (dict, list)):
+        return payload
+    raise ValueError(f"Unsupported payload type: {type(payload)}")
+
 
 def _extract_json_payload(raw_response: str) -> Any:
     """Recover JSON payloads when the model wraps them in prose or markdown fences."""
@@ -43,6 +53,11 @@ def _extract_json_payload(raw_response: str) -> Any:
             payload = json.loads(candidate)
             return payload
         except json.JSONDecodeError:
+            pass
+
+        try:
+            return _coerce_python_payload(candidate)
+        except Exception:
             continue
 
     raise ValueError("Model response did not contain a valid JSON payload.")
@@ -217,39 +232,60 @@ def _normalize_cleaned_batch_payload(cleaned_batch: Any) -> Any:
     return cleaned_batch
 
 
-def _trim_whitespace_in_string_cells(df: pd.DataFrame) -> pd.DataFrame:
-    trimmed_df = df.copy()
+def _prompt_mentions_missing_values(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    missing_terms = [
+        "missing",
+        "null",
+        "blank",
+        "empty",
+        "n/a",
+        "placeholder",
+    ]
+    return any(term in normalized_prompt for term in missing_terms)
 
-    for column in trimmed_df.columns:
-        series = trimmed_df[column]
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-            trimmed_df[column] = series.map(
-                lambda value: value.strip() if isinstance(value, str) else value
-            )
 
-    return trimmed_df
+def _apply_text_cleaning(
+    df: pd.DataFrame,
+    *,
+    normalize_missing: bool = False,
+    trim_whitespace: bool = False,
+) -> pd.DataFrame:
+    if not normalize_missing and not trim_whitespace:
+        return df
 
-
-def _normalize_missing_tokens(df: pd.DataFrame) -> pd.DataFrame:
-    normalized_df = df.copy()
     null_tokens = {
         token.strip().lower()
         for token in settings.NULL_TOKENS.split(",")
         if token.strip()
-    }
+    } if normalize_missing else set()
 
+    normalized_df = df.copy()
     for column in normalized_df.columns:
         series = normalized_df[column]
-        if pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series):
-            normalized_df[column] = series.map(
-                lambda value: (
-                    pd.NA
-                    if isinstance(value, str) and value.strip().lower() in null_tokens
-                    else value
-                )
-            )
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        def _transform_value(value):
+            if not isinstance(value, str):
+                return value
+
+            transformed = value.strip() if trim_whitespace else value
+            if normalize_missing and transformed.strip().lower() in null_tokens:
+                return pd.NA
+            return transformed
+
+        normalized_df[column] = series.map(_transform_value)
 
     return normalized_df
+
+
+def _trim_whitespace_in_string_cells(df: pd.DataFrame) -> pd.DataFrame:
+    return _apply_text_cleaning(df, trim_whitespace=True)
+
+
+def _normalize_missing_tokens(df: pd.DataFrame) -> pd.DataFrame:
+    return _apply_text_cleaning(df, normalize_missing=True)
 
 
 def _should_remove_exact_duplicates(user_prompt: str) -> bool:
@@ -353,6 +389,37 @@ def _is_missing_value_only_prompt(user_prompt: str) -> bool:
     )
 
 
+def _is_date_only_prompt(user_prompt: str) -> bool:
+    """
+    Identify prompts that only ask for date/datetime normalization, which can be
+    handled deterministically without LLM calls.
+    """
+    normalized_prompt = user_prompt.strip().lower()
+    date_terms = [
+        "date format",
+        "dates",
+        "date column",
+        "date columns",
+        "datetime",
+        "timestamp",
+        "date/time",
+    ]
+    ai_terms = [
+        "standardize spelling",
+        "correct spelling",
+        "category",
+        "map",
+        "typo",
+        "capitalize",
+        "capitalization",
+        "text",
+        "string",
+    ]
+    return any(term in normalized_prompt for term in date_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
 def _is_duplicate_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
     duplicate_terms = [
@@ -381,6 +448,7 @@ def _requires_ai_cleaning(user_prompt: str) -> bool:
     deterministic_only = (
         _is_duplicate_only_prompt(user_prompt)
         or _is_missing_value_only_prompt(user_prompt)
+        or _is_date_only_prompt(user_prompt)
         or _should_normalize_headers(user_prompt)
         or _should_trim_whitespace(user_prompt)
     )
@@ -411,12 +479,51 @@ def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
     return normalized_df
 
 
+def _normalize_date_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Try to normalize date-like string columns to the configured output format
+    without relying on the LLM. We only transform columns where a majority of
+    non-null values parse as dates to avoid false positives.
+    """
+    normalized_df = df.copy()
+    for column in normalized_df.columns:
+        series = normalized_df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        series_non_null = series[series.notna()]
+        if series_non_null.empty:
+            continue
+
+        parsed = pd.to_datetime(
+            series_non_null,
+            errors="coerce",
+            infer_datetime_format=True,
+            utc=False,
+        )
+        success_ratio = parsed.notna().mean()
+        # Require a reasonable share of valid parses to avoid changing non-date columns.
+        if success_ratio < 0.5:
+            continue
+
+        formatted = parsed.dt.strftime(settings.DATE_OUTPUT_FORMAT)
+        updated_series = series.copy()
+        updated_series.loc[formatted.index] = formatted
+        normalized_df[column] = updated_series
+
+    return normalized_df
+
+
 def _build_cleaning_chain():
-    llm = ChatOllama(
-        model=settings.OLLAMA_MODEL,
-        base_url=settings.OLLAMA_BASE_URL,
-        temperature=0.0,
-    )
+    llm_kwargs = {
+        "model": settings.OLLAMA_MODEL,
+        "base_url": settings.OLLAMA_BASE_URL,
+        "temperature": 0.0,
+    }
+    try:
+        llm = ChatOllama(format="json", **llm_kwargs)
+    except TypeError:
+        llm = ChatOllama(**llm_kwargs)
     return clean_data_prompt_template | llm | StrOutputParser()
 
 
@@ -430,6 +537,73 @@ def prompt_requires_ai_cleaning(user_prompt: str) -> bool:
 
 def prompt_removes_exact_duplicates(user_prompt: str) -> bool:
     return _should_remove_exact_duplicates(user_prompt)
+
+
+def _normalize_text_for_match(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+def _extract_target_columns_from_prompt(columns: list[str], user_prompt: str) -> set[str]:
+    normalized_prompt = f" {_normalize_text_for_match(user_prompt)} "
+    target_columns: set[str] = set()
+
+    for column in columns:
+        column_label = str(column).strip()
+        if not column_label:
+            continue
+
+        variants = {
+            column_label.lower(),
+            column_label.lower().replace("_", " "),
+            _to_snake_case(column_label).replace("_", " "),
+            _normalize_text_for_match(column_label),
+        }
+        if any(variant and f" {variant} " in normalized_prompt for variant in variants):
+            target_columns.add(column_label)
+
+    return target_columns
+
+
+def _merge_cleaned_row(
+    original_row: dict[str, Any],
+    cleaned_row: Any,
+    target_columns: set[str],
+) -> dict[str, Any]:
+    if not isinstance(cleaned_row, dict):
+        return dict(original_row)
+
+    merged = dict(original_row)
+    columns_to_apply = target_columns or set(original_row.keys())
+    for column in columns_to_apply:
+        if column in cleaned_row:
+            merged[column] = cleaned_row[column]
+    return merged
+
+
+def _build_ai_view_row(
+    original_row: dict[str, Any],
+    ai_columns: list[str],
+) -> dict[str, Any]:
+    if not ai_columns:
+        return dict(original_row)
+    return {column: original_row.get(column) for column in ai_columns}
+
+
+def _compute_record_hashes(
+    records: list[dict[str, Any]],
+    *,
+    columns: list[str],
+) -> list[int]:
+    if not records:
+        return []
+
+    comparable_df = pd.DataFrame(records, columns=columns)
+    comparable_df = comparable_df.astype(object).where(pd.notnull(comparable_df), settings.NULL_OUTPUT_TOKEN)
+    return (
+        pd.util.hash_pandas_object(comparable_df.astype(str), index=False)
+        .astype("uint64")
+        .tolist()
+    )
 
 
 def _invoke_cleaning_batch(
@@ -465,6 +639,55 @@ def _invoke_cleaning_batch(
             last_error = exc
 
     raise last_error if last_error is not None else ValueError("Cleaning batch failed")
+
+
+def _invoke_cleaning_batch_with_fallback(
+    chain,
+    batch_records: list[dict[str, Any]],
+    user_prompt: str,
+) -> list[dict[str, Any]]:
+    expected_rows = len(batch_records)
+    if expected_rows == 0:
+        return []
+
+    batch_json = json.dumps(batch_records, ensure_ascii=False, separators=(",", ":"))
+
+    try:
+        return _invoke_cleaning_batch(
+            chain=chain,
+            batch_json=batch_json,
+            user_prompt=user_prompt,
+            expected_rows=expected_rows,
+        )
+    except Exception:
+        if expected_rows == 1:
+            # Do not fail the entire cleaning run for a single bad model output.
+            # Keep the original row unchanged in this case.
+            return [dict(batch_records[0])]
+
+        mid = expected_rows // 2
+        left_records = batch_records[:mid]
+        right_records = batch_records[mid:]
+
+        try:
+            left_cleaned = _invoke_cleaning_batch_with_fallback(
+                chain,
+                left_records,
+                user_prompt,
+            )
+        except Exception:
+            left_cleaned = [dict(row) for row in left_records]
+
+        try:
+            right_cleaned = _invoke_cleaning_batch_with_fallback(
+                chain,
+                right_records,
+                user_prompt,
+            )
+        except Exception:
+            right_cleaned = [dict(row) for row in right_records]
+
+        return left_cleaned + right_cleaned
 
 
 def analyze_dataset(df: pd.DataFrame) -> DatasetAnalysisResponse:
@@ -534,12 +757,21 @@ def clean_dataframe_chunk(
     *,
     chain=None,
     seen_row_hashes: set[int] | None = None,
+    ai_row_cache: dict[int, dict[str, Any]] | None = None,
 ) -> pd.DataFrame:
-    cleaned_df = _normalize_missing_tokens(df)
-    cleaned_df = _trim_whitespace_in_string_cells(cleaned_df)
+    should_normalize_missing = _prompt_mentions_missing_values(user_prompt)
+    should_trim_whitespace = _should_trim_whitespace(user_prompt)
+    cleaned_df = _apply_text_cleaning(
+        df,
+        normalize_missing=should_normalize_missing,
+        trim_whitespace=should_trim_whitespace,
+    )
 
     if _should_normalize_headers(user_prompt):
         cleaned_df = _normalize_headers(cleaned_df)
+
+    if _is_date_only_prompt(user_prompt):
+        cleaned_df = _normalize_date_columns(cleaned_df)
 
     if _should_remove_exact_duplicates(user_prompt):
         if seen_row_hashes is None:
@@ -555,26 +787,73 @@ def clean_dataframe_chunk(
         settings.AI_BATCH_SIZE,
         max(10, 1200 // max(len(cleaned_df.columns), 1)),
     )
-    cleaned_rows = []
+    target_columns = _extract_target_columns_from_prompt(
+        [str(column) for column in cleaned_df.columns],
+        user_prompt,
+    )
+    ai_columns = (
+        [column for column in cleaned_df.columns if str(column) in target_columns]
+        if target_columns
+        else [str(column) for column in cleaned_df.columns]
+    )
 
     # Fill NAs to None for JSON
     df_clean = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
     records = df_clean.to_dict(orient="records")
+    ai_records = [_build_ai_view_row(record, ai_columns) for record in records]
+    row_hashes = _compute_record_hashes(ai_records, columns=ai_columns)
+    resolved_fragments: list[dict[str, Any] | None] = [None] * len(records)
+    positions_by_hash: dict[int, list[int]] = {}
+    unique_records: list[dict[str, Any]] = []
+    unique_hashes: list[int] = []
 
-    for i in range(0, len(records), batch_size):
-        batch = records[i:i + batch_size]
-        batch_json = json.dumps(batch, indent=2)
+    for index, (record, row_hash) in enumerate(zip(ai_records, row_hashes)):
+        if ai_row_cache is not None and row_hash in ai_row_cache:
+            resolved_fragments[index] = dict(ai_row_cache[row_hash])
+            continue
+
+        positions = positions_by_hash.setdefault(row_hash, [])
+        positions.append(index)
+        if len(positions) == 1:
+            unique_records.append(record)
+            unique_hashes.append(row_hash)
+
+    for i in range(0, len(unique_records), batch_size):
+        batch = unique_records[i:i + batch_size]
+        batch_hashes = unique_hashes[i:i + batch_size]
 
         try:
-            cleaned_batch = _invoke_cleaning_batch(
+            cleaned_batch = _invoke_cleaning_batch_with_fallback(
                 chain=active_chain,
-                batch_json=batch_json,
+                batch_records=batch,
                 user_prompt=user_prompt,
-                expected_rows=len(batch),
             )
-            cleaned_rows.extend(cleaned_batch)
         except Exception as e:
             print(f"Error cleaning batch {i} to {i + batch_size}: {e}")
-            cleaned_rows.extend(batch)
+            cleaned_batch = batch
 
-    return pd.DataFrame(cleaned_rows)
+        merged_batch = [
+            _merge_cleaned_row(
+                original_row=original_row,
+                cleaned_row=cleaned_row,
+                target_columns=target_columns,
+            )
+            for original_row, cleaned_row in zip(batch, cleaned_batch)
+        ]
+
+        for row_hash, merged_row in zip(batch_hashes, merged_batch):
+            if ai_row_cache is not None:
+                ai_row_cache[row_hash] = dict(merged_row)
+
+            for row_index in positions_by_hash.get(row_hash, []):
+                resolved_fragments[row_index] = dict(merged_row)
+
+    final_rows = [
+        _merge_cleaned_row(
+            original_row=records[index],
+            cleaned_row=resolved_fragments[index] if resolved_fragments[index] is not None else ai_records[index],
+            target_columns=target_columns,
+        )
+        for index in range(len(records))
+    ]
+    return pd.DataFrame(final_rows, columns=cleaned_df.columns)

@@ -15,8 +15,10 @@ app = FastAPI(
 async def on_startup():
     from app.db.session import engine
     from app.db.base import Base
+    import app.models.chat_history
     import app.models.cleaned_data
     import app.models.job
+    import app.models.semantic_column_metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
