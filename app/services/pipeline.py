@@ -166,7 +166,7 @@ async def clean_csv_with_prompt(job_id: str, prompt: str) -> CleanDataResponse:
     return CleanDataResponse(
         job_id=job_id,
         status="completed",
-        cleaned_file_url=f"/api/v1/download-cleaned/{job_id}",
+        cleaned_file_url=f"/api/v1/clean/{job_id}/download",
         cleaned_rows=total_rows,
         cleaned_data=cleaned_preview,
     )

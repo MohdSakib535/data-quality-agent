@@ -22,6 +22,7 @@ class JobListResponse(BaseModel):
 
 # AI Analysis Schemas
 class DataSuggestion(BaseModel):
+    id: Optional[str] = Field(None, description="Unique identifier for this suggestion")
     issue_description: str = Field(description="Description of the data issue found")
     priority: str = Field(description="Priority of the issue: Low, Medium, High")
     resolution_prompt: str = Field(description="Suggested prompt to send to the AI to clean this issue")
@@ -34,6 +35,18 @@ class DatasetAnalysisResponse(BaseModel):
     job_id: str = Field(description="The job ID for this dataset")
     quality_score: int = Field(ge=0, le=100, description="Overall quality score from 0 to 100")
     suggestions: List[DataSuggestion] = Field(default_factory=list, description="List of suggested cleaning actions")
+
+class SuggestionDetailResponse(BaseModel):
+    id: str = Field(description="Unique identifier for this suggestion")
+    job_id: str = Field(description="The job/file ID this suggestion belongs to")
+    issue_description: str = Field(description="Description of the data issue found")
+    priority: str = Field(description="Priority of the issue: Low, Medium, High")
+    resolution_prompt: str = Field(description="Suggested prompt to send to the AI to clean this issue")
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
 
 class FileUploadResponse(BaseModel):
     file_id: str = Field(description="The stored file ID")

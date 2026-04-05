@@ -3,8 +3,7 @@ import asyncio
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
-from app.api.routes import router
-from app.routers.chat_with_data import router as chat_router
+from app.api.router import api_router
 from app.core.config import settings
 import uvicorn
 
@@ -22,6 +21,7 @@ async def on_startup():
     from app.services.object_storage import get_object_storage_service
     import app.models.chat_history
     import app.models.cleaned_data
+    import app.models.analysis_suggestion
     import app.models.job
     import app.models.semantic_column_metadata
     async with engine.begin() as conn:
@@ -40,8 +40,7 @@ app.add_middleware(
 )
 
 # Include the endpoints router
-app.include_router(router, prefix="/api/v1")
-app.include_router(chat_router)
+app.include_router(api_router, prefix="/api/v1")
 
 @app.get("/")
 def read_root():

@@ -12,7 +12,7 @@ A production-ready, general-purpose AI agent that safely cleans any CSV file wit
 ## How It Works
 
 1. **Upload**: User posts a CSV file to `/api/v1/upload-csv`. The system returns a `job_id`.
-2. **Clean**: User triggers `/api/v1/clean-csv/{job_id}`.
+2. **Clean**: User triggers `/api/v1/clean/{job_id}`.
    - The cleaning request runs synchronously and returns only after processing finishes with `completed` or `failed`.
    - **Profile**: System calculates sparsity, unique ratios, string limits.
    - **Infer Types**: Safely predicts `category_text`, `date`, `float`, `identifier`, etc.
@@ -20,7 +20,7 @@ A production-ready, general-purpose AI agent that safely cleans any CSV file wit
    - **AI Clean**: Batches remaining muddy textual columns (`category_text`, `name`) and asks Ollama to standardize spelling, correct casing, or expand standard acronyms, producing strict JSON arrays.
    - **Validation**: Checks AI confidence. Outputs >= 95% are adopted automatically. Lower confidence results in the row being shunted to a manual review queue.
 3. **Download**: User downloads the output artifacts:
-   - `/api/v1/download-cleaned/{job_id}`: The pristine CSV.
+   - `/api/v1/clean/{job_id}/download`: The pristine CSV.
    - `/api/v1/download-review/{job_id}`: A sub-CSV containing rows the AI was unsure about.
    - `/api/v1/download-audit/{job_id}`: A deep JSON log proving *every single decision* (AI or heuristic), keeping the original value intact for traceback.
 

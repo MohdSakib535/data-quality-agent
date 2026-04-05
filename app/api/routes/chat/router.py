@@ -41,7 +41,7 @@ from app.utils.chat_utils import (
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/chat", tags=["Chat with Data"])
+router = APIRouter(prefix="/chat", tags=["chat"])
 CHAT_RESPONSE_EXCLUDED_FIELDS = {"prompt", "cleaned_file_path"}
 
 

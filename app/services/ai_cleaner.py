@@ -19,6 +19,7 @@ from app.services.deterministic_cleaner import (
     compute_quality_score,
     generate_rule_based_suggestions,
 )
+from app.services.llm_privacy import redact_analysis_profile, select_llm_safe_columns
 
 try:
     from langchain_ollama import ChatOllama
@@ -134,13 +135,14 @@ def warm_analysis_runtime_cache() -> None:
 
 
 def _build_analysis_llm_payload(profile: dict[str, Any]) -> dict[str, Any]:
+    redacted_profile = redact_analysis_profile(profile)
     payload = {
-        "row_count_sampled": profile.get("row_count_sampled", 0),
-        "quality_score": profile.get("quality_score", 0),
-        "duplicate_row_percent": profile.get("duplicate_row_percent", 0.0),
-        "columns": profile.get("columns", []),
-        "dataset_issues": profile.get("dataset_issues", []),
-        "sample_rows": profile.get("sample_rows", [])[:5],
+        "row_count_sampled": redacted_profile.get("row_count_sampled", 0),
+        "quality_score": redacted_profile.get("quality_score", 0),
+        "duplicate_row_percent": redacted_profile.get("duplicate_row_percent", 0.0),
+        "columns": redacted_profile.get("columns", []),
+        "dataset_issues": redacted_profile.get("dataset_issues", []),
+        "sample_rows": redacted_profile.get("sample_rows", [])[:5],
     }
     return payload
 
@@ -724,6 +726,16 @@ def clean_dataframe_chunk(
         if target_columns
         else [str(column) for column in cleaned_df.columns]
     )
+    requested_ai_columns = list(ai_columns)
+    ai_columns = select_llm_safe_columns(cleaned_df, ai_columns)
+
+    if not ai_columns:
+        if requested_ai_columns:
+            logger.info(
+                "Skipping raw LLM cleaning because all candidate columns were privacy-blocked: %s",
+                requested_ai_columns,
+            )
+        return cleaned_df
 
     # Fill NAs to None for JSON
     df_clean = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)
