@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     # Processing settings
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
     AI_BATCH_SIZE: int = 50
+    AI_VALUE_BATCH_SIZE: int = 200
+    AI_VALUE_CLEAN_MAX_UNIQUE_VALUES: int = 5000
+    AI_VALUE_CLEAN_MAX_COLUMNS: int = 5
+    AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD: int = 50000
     ANALYSIS_SAMPLE_ROWS: int = 500
     CLEAN_PREVIEW_ROWS: int = 25
     CONFIDENCE_AUTO_ACCEPT: float = 0.95

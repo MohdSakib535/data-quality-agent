@@ -27,6 +27,14 @@ async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
         await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS file_url VARCHAR"))
+        await conn.execute(text("ALTER TABLE cleaned_data ADD COLUMN IF NOT EXISTS source_file_id VARCHAR"))
+        await conn.execute(text("ALTER TABLE cleaned_data ADD COLUMN IF NOT EXISTS cleaned_rows INTEGER"))
+        await conn.execute(text("ALTER TABLE cleaned_data ADD COLUMN IF NOT EXISTS quality_score INTEGER"))
+        await conn.execute(text("ALTER TABLE cleaned_data ADD COLUMN IF NOT EXISTS analysis JSON"))
+        await conn.execute(text("ALTER TABLE analysis_suggestions ADD COLUMN IF NOT EXISTS source_type VARCHAR"))
+        await conn.execute(text("UPDATE cleaned_data SET source_file_id = job_id WHERE source_file_id IS NULL"))
+        await conn.execute(text("UPDATE cleaned_data SET cleaned_rows = 0 WHERE cleaned_rows IS NULL"))
+        await conn.execute(text("UPDATE analysis_suggestions SET source_type = 'raw' WHERE source_type IS NULL"))
     await asyncio.to_thread(warm_analysis_runtime_cache)
     await asyncio.to_thread(get_object_storage_service().ensure_bucket)
 

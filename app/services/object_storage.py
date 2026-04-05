@@ -16,7 +16,7 @@ def raw_upload_key(job_id: str) -> str:
 
 
 def cleaned_output_key(job_id: str) -> str:
-    return f"outputs/{job_id}_cleaned.csv"
+    return f"uploads/clean_data/{job_id}_cleaned.csv"
 
 
 class ObjectStorageService:

@@ -15,6 +15,9 @@ from app.prompts.cleaning_prompts import clean_data_prompt_template
 from app.schemas.job import DataSuggestion, DatasetAnalysisResponse
 from app.core.config import settings
 from app.services.deterministic_cleaner import (
+    NUMERIC_COLUMN_HINTS,
+    PHONE_COLUMN_HINTS,
+    PHONE_PATTERN,
     _to_snake_case,
     compute_quality_score,
     generate_rule_based_suggestions,
@@ -380,6 +383,99 @@ def _is_date_only_prompt(user_prompt: str) -> bool:
     )
 
 
+def _is_phone_only_prompt(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    phone_terms = [
+        "phone",
+        "phones",
+        "mobile",
+        "contact number",
+        "country code",
+        "phone-like",
+        "punctuation noise",
+    ]
+    ai_terms = [
+        "standardize spelling",
+        "correct spelling",
+        "category",
+        "map",
+        "typo",
+        "capitalize",
+        "capitalization",
+        "name",
+        "address",
+        "email",
+        "date",
+    ]
+    return any(term in normalized_prompt for term in phone_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
+def _should_keep_only_valid_phone_rows(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    keep_terms = [
+        "keep only valid",
+        "only valid",
+        "remove invalid",
+        "drop invalid",
+        "valid phone-like",
+        "valid phone",
+    ]
+    return any(term in normalized_prompt for term in keep_terms)
+
+
+def _is_text_normalization_only_prompt(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    text_terms = [
+        "trim leading and trailing whitespace",
+        "leading and trailing whitespace",
+        "standardize casing",
+        "standardize case",
+        "whitespace inconsistencies",
+        "casing inconsistencies",
+        "repeated text values",
+        "text normalization",
+        "normalize text",
+        "whitespace",
+    ]
+    ai_terms = [
+        "category mapping",
+        "translate",
+        "summarize",
+        "rewrite",
+        "name formatting",
+        "address formatting",
+    ]
+    return any(term in normalized_prompt for term in text_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
+def _is_numeric_only_prompt(user_prompt: str) -> bool:
+    normalized_prompt = user_prompt.strip().lower()
+    numeric_terms = [
+        "numeric-like",
+        "numeric",
+        "numbers",
+        "currency symbols",
+        "separators",
+        "parse cleanly as numbers",
+        "formatting noise",
+    ]
+    ai_terms = [
+        "category",
+        "map",
+        "name",
+        "address",
+        "text",
+        "free text",
+    ]
+    return any(term in normalized_prompt for term in numeric_terms) and not any(
+        term in normalized_prompt for term in ai_terms
+    )
+
+
 def _is_duplicate_only_prompt(user_prompt: str) -> bool:
     normalized_prompt = user_prompt.strip().lower()
     duplicate_terms = [
@@ -409,9 +505,14 @@ def _requires_ai_cleaning(user_prompt: str) -> bool:
         _is_duplicate_only_prompt(user_prompt)
         or _is_missing_value_only_prompt(user_prompt)
         or _is_date_only_prompt(user_prompt)
+        or _is_phone_only_prompt(user_prompt)
+        or _is_text_normalization_only_prompt(user_prompt)
+        or _is_numeric_only_prompt(user_prompt)
         or _should_normalize_headers(user_prompt)
         or _should_trim_whitespace(user_prompt)
     )
+    if deterministic_only:
+        return False
 
     ai_terms = [
         "standardize",
@@ -430,7 +531,7 @@ def _requires_ai_cleaning(user_prompt: str) -> bool:
     if any(term in normalized_prompt for term in ai_terms):
         return True
 
-    return not deterministic_only
+    return True
 
 
 def _normalize_headers(df: pd.DataFrame) -> pd.DataFrame:
@@ -455,12 +556,20 @@ def _normalize_date_columns(df: pd.DataFrame) -> pd.DataFrame:
         if series_non_null.empty:
             continue
 
-        parsed = pd.to_datetime(
-            series_non_null,
-            errors="coerce",
-            infer_datetime_format=True,
-            utc=False,
-        )
+        try:
+            parsed = pd.to_datetime(
+                series_non_null,
+                errors="coerce",
+                infer_datetime_format=True,
+                utc=False,
+            )
+        except TypeError:
+            # pandas >= 2.0 removed infer_datetime_format; fall back cleanly.
+            parsed = pd.to_datetime(
+                series_non_null,
+                errors="coerce",
+                utc=False,
+            )
         success_ratio = parsed.notna().mean()
         # Require a reasonable share of valid parses to avoid changing non-date columns.
         if success_ratio < 0.5:
@@ -469,6 +578,186 @@ def _normalize_date_columns(df: pd.DataFrame) -> pd.DataFrame:
         formatted = parsed.dt.strftime(settings.DATE_OUTPUT_FORMAT)
         updated_series = series.copy()
         updated_series.loc[formatted.index] = formatted
+        normalized_df[column] = updated_series
+
+    return normalized_df
+
+
+def _is_phone_candidate_column(column_name: str, series: pd.Series) -> bool:
+    normalized_name = column_name.strip().lower()
+    if any(hint in normalized_name for hint in PHONE_COLUMN_HINTS):
+        return True
+
+    string_series = series.astype("string")
+    non_null_values = string_series[series.notna()].str.strip()
+    if non_null_values.empty:
+        return False
+
+    phone_digits = non_null_values.str.replace(r"\D+", "", regex=True)
+    validity_ratio = float(phone_digits.str.fullmatch(PHONE_PATTERN, na=False).mean())
+    return validity_ratio >= 0.6
+
+
+def _normalize_phone_value(value: Any) -> tuple[Any, bool]:
+    if pd.isna(value):
+        return value, True
+
+    text = str(value).strip()
+    if not text:
+        return value, True
+
+    digits = re.sub(r"\D+", "", text)
+    if not digits or not PHONE_PATTERN.fullmatch(digits):
+        return value, False
+
+    has_explicit_country_code = text.startswith("+") or len(digits) > 10
+    normalized = f"+{digits}" if has_explicit_country_code else digits
+    return normalized, True
+
+
+def _normalize_phone_columns(df: pd.DataFrame, *, keep_only_valid_rows: bool = False) -> pd.DataFrame:
+    normalized_df = df.copy()
+    keep_mask = pd.Series(True, index=normalized_df.index)
+
+    for column in normalized_df.columns:
+        series = normalized_df[column]
+        if not (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+            or pd.api.types.is_numeric_dtype(series)
+        ):
+            continue
+
+        if not _is_phone_candidate_column(str(column), series):
+            continue
+
+        normalized_values: list[Any] = []
+        valid_flags: list[bool] = []
+
+        for value in series.tolist():
+            normalized_value, is_valid = _normalize_phone_value(value)
+            normalized_values.append(normalized_value)
+            valid_flags.append(is_valid)
+
+        normalized_df[column] = normalized_values
+
+        if keep_only_valid_rows:
+            non_empty_mask = series.notna() & series.astype("string").str.strip().ne("")
+            valid_series = pd.Series(valid_flags, index=normalized_df.index)
+            keep_mask &= (~non_empty_mask) | valid_series
+
+    if keep_only_valid_rows:
+        normalized_df = normalized_df.loc[keep_mask].reset_index(drop=True)
+
+    return normalized_df
+
+
+def _is_moderate_cardinality_text_column(series: pd.Series) -> bool:
+    string_series = series.astype("string")
+    non_null_values = string_series[series.notna()].str.strip()
+    if non_null_values.empty:
+        return False
+
+    unique_count = int(non_null_values.nunique(dropna=True))
+    unique_ratio = unique_count / max(len(non_null_values), 1)
+    average_length = float(non_null_values.str.len().fillna(0).mean())
+    return unique_count <= 200 and unique_ratio <= 0.5 and average_length <= 80
+
+
+def _canonical_text_variant(values: pd.Series) -> str:
+    trimmed_values = values.astype("string").dropna().str.strip()
+    trimmed_values = trimmed_values[trimmed_values.ne("")]
+    if trimmed_values.empty:
+        return ""
+
+    counts = trimmed_values.value_counts()
+    if not counts.empty:
+        return str(counts.index[0])
+    return str(trimmed_values.iloc[0])
+
+
+def _normalize_text_columns(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = _apply_text_cleaning(df, trim_whitespace=True)
+
+    for column in normalized_df.columns:
+        series = normalized_df[column]
+        if not (pd.api.types.is_object_dtype(series) or pd.api.types.is_string_dtype(series)):
+            continue
+
+        if not _is_moderate_cardinality_text_column(series):
+            continue
+
+        string_series = series.astype("string")
+        trimmed_series = string_series.str.strip()
+        normalized_keys = trimmed_series.str.lower()
+        non_empty_mask = trimmed_series.notna() & trimmed_series.ne("")
+        if not non_empty_mask.any():
+            continue
+
+        canonical_map: dict[str, str] = {}
+        for key, group in trimmed_series[non_empty_mask].groupby(normalized_keys[non_empty_mask]):
+            if key is pd.NA or key is None or str(key).strip() == "":
+                continue
+            canonical_map[str(key)] = _canonical_text_variant(group)
+
+        normalized_df[column] = [
+            canonical_map.get(str(key), value) if pd.notna(key) else value
+            for value, key in zip(trimmed_series.tolist(), normalized_keys.tolist())
+        ]
+
+    return normalized_df
+
+
+def _is_numeric_candidate_column(column_name: str, series: pd.Series) -> bool:
+    normalized_name = column_name.strip().lower()
+    if any(hint in normalized_name for hint in NUMERIC_COLUMN_HINTS):
+        return True
+
+    string_series = series.astype("string")
+    non_null_values = string_series[series.notna()].str.strip()
+    if non_null_values.empty:
+        return False
+
+    cleaned_values = non_null_values.str.replace(r"[,\s$₹€£%]", "", regex=True)
+    parsed = pd.to_numeric(cleaned_values, errors="coerce")
+    return float(parsed.notna().mean()) >= 0.6
+
+
+def _format_numeric_value(value: float) -> str:
+    if pd.isna(value):
+        return ""
+    if float(value).is_integer():
+        return str(int(value))
+    return format(float(value), "f").rstrip("0").rstrip(".")
+
+
+def _normalize_numeric_columns(df: pd.DataFrame) -> pd.DataFrame:
+    normalized_df = df.copy()
+
+    for column in normalized_df.columns:
+        series = normalized_df[column]
+        if not (
+            pd.api.types.is_object_dtype(series)
+            or pd.api.types.is_string_dtype(series)
+            or pd.api.types.is_numeric_dtype(series)
+        ):
+            continue
+
+        if not _is_numeric_candidate_column(str(column), series):
+            continue
+
+        string_series = series.astype("string")
+        non_empty_mask = series.notna() & string_series.str.strip().ne("")
+        if not non_empty_mask.any():
+            continue
+
+        cleaned_values = string_series.str.replace(r"[,\s$₹€£%]", "", regex=True)
+        parsed = pd.to_numeric(cleaned_values.where(non_empty_mask), errors="coerce")
+        formatted = parsed.map(_format_numeric_value)
+
+        updated_series = string_series.copy()
+        valid_mask = non_empty_mask & parsed.notna()
+        updated_series.loc[valid_mask] = formatted.loc[valid_mask]
         normalized_df[column] = updated_series
 
     return normalized_df
@@ -650,6 +939,79 @@ def _invoke_cleaning_batch_with_fallback(
         return left_cleaned + right_cleaned
 
 
+def _clean_column_values_with_ai(
+    df: pd.DataFrame,
+    *,
+    ai_columns: list[str],
+    user_prompt: str,
+    chain,
+    ai_value_cache: dict[str, Any] | None = None,
+) -> pd.DataFrame:
+    cleaned_df = df.copy()
+    batch_size = max(1, settings.AI_VALUE_BATCH_SIZE)
+
+    for column in ai_columns:
+        if column not in cleaned_df.columns:
+            continue
+
+        series = cleaned_df[column]
+        string_series = series.astype("string")
+        non_empty_values = string_series[series.notna()].str.strip()
+        non_empty_values = non_empty_values[non_empty_values.ne("")]
+        unique_values = non_empty_values.drop_duplicates().tolist()
+
+        if not unique_values:
+            continue
+
+        unresolved_values = [
+            value
+            for value in unique_values
+            if ai_value_cache is None or f"{column}::{value}" not in ai_value_cache
+        ]
+
+        if len(unresolved_values) > settings.AI_VALUE_CLEAN_MAX_UNIQUE_VALUES:
+            raise ValueError(
+                f"AI cleaning for column '{column}' is too large for a scoped value-mapping pass. "
+                "Narrow the prompt further or use a deterministic cleaning instruction."
+            )
+
+        value_map: dict[str, Any] = {}
+        if ai_value_cache is not None:
+            for value in unique_values:
+                cache_key = f"{column}::{value}"
+                if cache_key in ai_value_cache:
+                    value_map[value] = ai_value_cache[cache_key]
+
+        for start in range(0, len(unresolved_values), batch_size):
+            batch_values = unresolved_values[start:start + batch_size]
+            batch_records = [{column: value} for value in batch_values]
+            cleaned_batch = _invoke_cleaning_batch_with_fallback(
+                chain=chain,
+                batch_records=batch_records,
+                user_prompt=user_prompt,
+            )
+
+            for original_record, cleaned_record in zip(batch_records, cleaned_batch):
+                original_value = original_record[column]
+                mapped_value = (
+                    cleaned_record.get(column, original_value)
+                    if isinstance(cleaned_record, dict)
+                    else original_value
+                )
+                value_map[str(original_value)] = mapped_value
+                if ai_value_cache is not None:
+                    ai_value_cache[f"{column}::{original_value}"] = mapped_value
+
+        cleaned_df[column] = [
+            value_map.get(str(value).strip(), value)
+            if pd.notna(value) and str(value).strip()
+            else value
+            for value in series.tolist()
+        ]
+
+    return cleaned_df
+
+
 async def analyze_dataset(profile: dict[str, Any]) -> tuple[DatasetAnalysisResponse, float]:
     """
     Summarize a deterministic profile into user-facing suggestions.
@@ -703,6 +1065,18 @@ def clean_dataframe_chunk(
     if _is_date_only_prompt(user_prompt):
         cleaned_df = _normalize_date_columns(cleaned_df)
 
+    if _is_phone_only_prompt(user_prompt):
+        cleaned_df = _normalize_phone_columns(
+            cleaned_df,
+            keep_only_valid_rows=_should_keep_only_valid_phone_rows(user_prompt),
+        )
+
+    if _is_text_normalization_only_prompt(user_prompt):
+        cleaned_df = _normalize_text_columns(cleaned_df)
+
+    if _is_numeric_only_prompt(user_prompt):
+        cleaned_df = _normalize_numeric_columns(cleaned_df)
+
     if _should_remove_exact_duplicates(user_prompt):
         if seen_row_hashes is None:
             cleaned_df = _remove_exact_duplicate_rows(cleaned_df)
@@ -736,6 +1110,25 @@ def clean_dataframe_chunk(
                 requested_ai_columns,
             )
         return cleaned_df
+
+    if (
+        len(cleaned_df) >= settings.AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD
+        and not target_columns
+    ):
+        raise ValueError(
+            "For large datasets, AI cleaning prompts must mention the target column names explicitly "
+            "or use a deterministic cleaning instruction."
+        )
+
+    if target_columns and len(ai_columns) <= settings.AI_VALUE_CLEAN_MAX_COLUMNS:
+        active_chain = chain or _build_cleaning_chain()
+        return _clean_column_values_with_ai(
+            cleaned_df,
+            ai_columns=ai_columns,
+            user_prompt=user_prompt,
+            chain=active_chain,
+            ai_value_cache=ai_row_cache,
+        )
 
     # Fill NAs to None for JSON
     df_clean = cleaned_df.astype(object).where(pd.notnull(cleaned_df), None)

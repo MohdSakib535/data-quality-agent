@@ -10,6 +10,7 @@ from fastapi import UploadFile
 import pandas as pd
 from app.core.config import settings
 from app.services.object_storage import (
+    cleaned_output_key,
     get_object_storage_service,
     raw_upload_key,
 )
@@ -80,16 +81,16 @@ def save_upload_file(upload_file: UploadFile) -> tuple[str, str]:
 
 
 @contextmanager
-def _download_job_file(job_id: str):
-    fd, file_path = tempfile.mkstemp(prefix=f"{job_id}_", suffix=".csv")
+def _download_object_file(key: str, prefix: str):
+    fd, file_path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=".csv")
     os.close(fd)
     try:
         restored = get_object_storage_service().download_file(
-            raw_upload_key(job_id),
+            key,
             file_path,
         )
         if not restored:
-            raise FileNotFoundError(f"File for job {job_id} not found.")
+            raise FileNotFoundError(f"File for key '{key}' not found.")
         yield file_path
     finally:
         if os.path.exists(file_path):
@@ -151,16 +152,24 @@ def _read_csv(file_path: str, encoding: str, delimiter: str, **kwargs):
     return pd.read_csv(file_path, sep=delimiter, **kwargs)
 
 
-def load_csv(job_id: str, **kwargs) -> pd.DataFrame:
-    """Load the bucket-backed CSV file into a pandas DataFrame."""
-    with _download_job_file(job_id) as file_path:
+def _load_csv_from_key(key: str, prefix: str, **kwargs) -> pd.DataFrame:
+    with _download_object_file(key, prefix) as file_path:
         csv_options = _detect_csv_options(file_path)
         return _read_csv(file_path, csv_options["encoding"], csv_options["delimiter"], **kwargs)
 
 
-def iter_csv_chunks(job_id: str, chunksize: int | None = None):
-    """Yield CSV data in chunks from object storage without persisting local copies."""
-    with _download_job_file(job_id) as file_path:
+def load_csv(job_id: str, **kwargs) -> pd.DataFrame:
+    """Load the raw uploaded CSV file into a pandas DataFrame."""
+    return _load_csv_from_key(raw_upload_key(job_id), f"{job_id}_raw", **kwargs)
+
+
+def load_cleaned_csv(job_id: str, **kwargs) -> pd.DataFrame:
+    """Load the cleaned CSV file into a pandas DataFrame."""
+    return _load_csv_from_key(cleaned_output_key(job_id), f"{job_id}_clean", **kwargs)
+
+
+def _iter_csv_chunks_from_key(key: str, prefix: str, chunksize: int | None = None):
+    with _download_object_file(key, prefix) as file_path:
         csv_options = _detect_csv_options(file_path)
         effective_chunksize = chunksize or settings.CHUNK_SIZE
         for chunk in _read_csv(
@@ -170,3 +179,13 @@ def iter_csv_chunks(job_id: str, chunksize: int | None = None):
             chunksize=effective_chunksize,
         ):
             yield chunk
+
+
+def iter_csv_chunks(job_id: str, chunksize: int | None = None):
+    """Yield raw uploaded CSV data in chunks from object storage."""
+    yield from _iter_csv_chunks_from_key(raw_upload_key(job_id), f"{job_id}_raw", chunksize=chunksize)
+
+
+def iter_cleaned_csv_chunks(job_id: str, chunksize: int | None = None):
+    """Yield cleaned CSV data in chunks from object storage."""
+    yield from _iter_csv_chunks_from_key(cleaned_output_key(job_id), f"{job_id}_clean", chunksize=chunksize)

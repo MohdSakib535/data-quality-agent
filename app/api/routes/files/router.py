@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.models.job import Job
-from app.schemas.job import FileUploadResponse
+from app.schemas.job import FileUploadResponse, JobListResponse, JobResponse
 from app.services.csv_loader import (
     SUPPORTED_UPLOAD_EXTENSIONS,
     is_supported_upload_file,
@@ -11,6 +12,18 @@ from app.services.csv_loader import (
 )
 
 router = APIRouter(prefix="/files", tags=["files"])
+
+
+@router.get("", response_model=JobListResponse)
+async def list_uploaded_files(db: AsyncSession = Depends(get_db)):
+    """List all uploaded source files."""
+    result = await db.execute(
+        select(Job)
+        .where(Job.file_url.is_not(None))
+        .order_by(Job.created_at.desc())
+    )
+    jobs = result.scalars().all()
+    return JobListResponse(jobs=[JobResponse.model_validate(job) for job in jobs])
 
 
 @router.post("/upload", response_model=FileUploadResponse)

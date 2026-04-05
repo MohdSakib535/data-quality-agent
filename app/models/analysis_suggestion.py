@@ -21,6 +21,7 @@ class AnalysisSuggestion(Base):
         nullable=False,
         index=True,
     )
+    source_type: Mapped[str] = mapped_column(String, nullable=False, index=True, default="raw")
     issue_description: Mapped[str] = mapped_column(Text, nullable=False)
     priority: Mapped[str] = mapped_column(String, nullable=False)
     resolution_prompt: Mapped[str] = mapped_column(Text, nullable=False)
