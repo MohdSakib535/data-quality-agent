@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+import tempfile
 import time
 from datetime import date, datetime
 
@@ -15,6 +16,10 @@ from app.services.ai_cleaner import (
     prompt_requires_ai_cleaning,
 )
 from app.services.deterministic_cleaner import build_dataset_profile
+from app.services.object_storage import (
+    cleaned_output_key,
+    get_object_storage_service,
+)
 from app.schemas.job import DatasetAnalysisResponse, CleanDataResponse
 from app.core.config import settings
 
@@ -58,8 +63,6 @@ def _load_analysis_sample(job_id: str) -> pd.DataFrame:
 
 
 def _clean_csv_file_with_prompt(job_id: str, prompt: str) -> tuple[str, list[dict], int]:
-    cleaned_filename = f"{job_id}_cleaned.csv"
-    output_path = os.path.join(settings.OUTPUT_DIR, cleaned_filename)
     preview_rows: list[dict] = []
     total_rows = 0
     wrote_header = False
@@ -73,48 +76,53 @@ def _clean_csv_file_with_prompt(job_id: str, prompt: str) -> tuple[str, list[dic
         else max(settings.CHUNK_SIZE, settings.CHUNK_SIZE * 10)
     )
 
-    if os.path.exists(output_path):
-        os.remove(output_path)
+    fd, output_path = tempfile.mkstemp(prefix=f"{job_id}_cleaned_", suffix=".csv")
+    os.close(fd)
 
-    with open(output_path, "w", encoding="utf-8", newline="") as output_file:
-        for chunk_df in iter_csv_chunks(job_id, chunksize=effective_chunksize):
-            cleaned_chunk = clean_dataframe_chunk(
-                chunk_df,
-                prompt,
-                chain=chain,
-                seen_row_hashes=seen_row_hashes,
-                ai_row_cache=ai_row_cache,
-            )
+    try:
+        with open(output_path, "w", encoding="utf-8", newline="") as output_file:
+            for chunk_df in iter_csv_chunks(job_id, chunksize=effective_chunksize):
+                cleaned_chunk = clean_dataframe_chunk(
+                    chunk_df,
+                    prompt,
+                    chain=chain,
+                    seen_row_hashes=seen_row_hashes,
+                    ai_row_cache=ai_row_cache,
+                )
 
-            preview_remaining = settings.CLEAN_PREVIEW_ROWS - len(preview_rows)
-            if preview_remaining > 0 and not cleaned_chunk.empty:
-                preview_rows.extend(_dataframe_to_json_records(cleaned_chunk.head(preview_remaining)))
+                preview_remaining = settings.CLEAN_PREVIEW_ROWS - len(preview_rows)
+                if preview_remaining > 0 and not cleaned_chunk.empty:
+                    preview_rows.extend(_dataframe_to_json_records(cleaned_chunk.head(preview_remaining)))
 
-            cleaned_chunk.to_csv(
-                output_file,
-                header=not wrote_header,
-                index=False,
-                na_rep=settings.NULL_OUTPUT_TOKEN,
-            )
-            wrote_header = True
-            total_rows += len(cleaned_chunk)
+                cleaned_chunk.to_csv(
+                    output_file,
+                    header=not wrote_header,
+                    index=False,
+                    na_rep=settings.NULL_OUTPUT_TOKEN,
+                )
+                wrote_header = True
+                total_rows += len(cleaned_chunk)
 
-        if not wrote_header:
-            empty_df = clean_dataframe_chunk(
-                load_csv(job_id, nrows=0),
-                prompt,
-                chain=chain,
-                seen_row_hashes=seen_row_hashes,
-                ai_row_cache=ai_row_cache,
-            )
-            empty_df.to_csv(
-                output_file,
-                header=True,
-                index=False,
-                na_rep=settings.NULL_OUTPUT_TOKEN,
-            )
+            if not wrote_header:
+                empty_df = clean_dataframe_chunk(
+                    load_csv(job_id, nrows=0),
+                    prompt,
+                    chain=chain,
+                    seen_row_hashes=seen_row_hashes,
+                    ai_row_cache=ai_row_cache,
+                )
+                empty_df.to_csv(
+                    output_file,
+                    header=True,
+                    index=False,
+                    na_rep=settings.NULL_OUTPUT_TOKEN,
+                )
 
-    return output_path, preview_rows, total_rows
+        file_url = get_object_storage_service().upload_file(output_path, cleaned_output_key(job_id))
+        return file_url, preview_rows, total_rows
+    finally:
+        if os.path.exists(output_path):
+            os.remove(output_path)
 
 
 async def analyze_csv(job_id: str) -> DatasetAnalysisResponse:
@@ -149,7 +157,7 @@ async def clean_csv_with_prompt(job_id: str, prompt: str) -> CleanDataResponse:
     """
     Load the CSV, clean it chunk-by-chunk, and write the cleaned output incrementally.
     """
-    output_path, cleaned_preview, total_rows = await asyncio.to_thread(
+    _, cleaned_preview, total_rows = await asyncio.to_thread(
         _clean_csv_file_with_prompt,
         job_id,
         prompt,

@@ -1,16 +1,23 @@
 import os
 import json
 import logging
+import tempfile
 import urllib.error
 import urllib.request
 
 import httpx
 from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from app.schemas.job import DatasetAnalysisResponse, CleanDataRequest, CleanDataResponse
+from app.schemas.job import (
+    DatasetAnalysisResponse,
+    CleanDataRequest,
+    CleanDataResponse,
+    FileUploadResponse,
+)
 from app.models.cleaned_data import CleanedData
 from app.models.job import Job
 from app.db.session import get_db
@@ -25,16 +32,20 @@ from app.services.chat_service import (
     get_cleaned_data_row_schema,
     get_table_schema,
 )
+from app.services.object_storage import (
+    cleaned_output_key,
+    get_object_storage_service,
+)
 from app.services.semantic_layer import ensure_semantic_metadata
 from app.core.config import settings
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-@router.post("/upload-analyze-csv", response_model=DatasetAnalysisResponse)
-async def upload_analyze_csv(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+@router.post("/upload-file", response_model=FileUploadResponse)
+async def upload_file(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
     """
-    Upload a CSV/Excel file and get an immediate AI-driven data quality analysis and suggestions.
+    Upload a CSV/Excel file, store it in object storage, and persist the file URL.
     """
     if not is_supported_upload_file(file):
         supported_extensions = ", ".join(sorted(SUPPORTED_UPLOAD_EXTENSIONS))
@@ -44,23 +55,52 @@ async def upload_analyze_csv(file: UploadFile = File(...), db: AsyncSession = De
         )
 
     try:
-        job_id = save_upload_file(file)
+        file_id, file_url = save_upload_file(file)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    
-    # Create DB entry
-    db_job = Job(id=job_id, status="analyzing", filename=file.filename)
+
+    db_job = Job(
+        id=file_id,
+        status="uploaded",
+        filename=file.filename,
+        file_url=file_url,
+    )
     db.add(db_job)
     await db.commit()
-    
+
+    return FileUploadResponse(
+        file_id=file_id,
+        filename=file.filename,
+        file_url=file_url,
+        status="uploaded",
+    )
+
+@router.post("/upload-analyze-csv/{file_id}", response_model=DatasetAnalysisResponse)
+async def upload_analyze_csv(file_id: str, db: AsyncSession = Depends(get_db)):
+    """
+    Analyze a previously uploaded CSV/Excel file by file ID.
+    """
+    db_job = await db.get(Job, file_id)
+    if db_job is None:
+        raise HTTPException(status_code=404, detail="File ID not found.")
+
+    db_job.status = "analyzing"
+    db_job.message = None
+    await db.commit()
+
     try:
-        # Run asynchronous analysis
-        analysis_response = await analyze_csv(job_id)
+        analysis_response = await analyze_csv(file_id)
         db_job.status = "analyzed"
         db_job.analysis = analysis_response.model_dump()
         db_job.quality_score = analysis_response.quality_score
         await db.commit()
         return analysis_response
+    except FileNotFoundError as exc:
+        await db.rollback()
+        db_job.status = "failed"
+        db_job.message = str(exc)
+        await db.commit()
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as e:
         await db.rollback()
         db_job.status = "failed"
@@ -81,12 +121,7 @@ async def trigger_cleaning(
     db_job = result.scalars().first()
     
     if not db_job:
-        file_path = os.path.join(settings.UPLOAD_DIR, f"{job_id}.csv")
-        if not os.path.exists(file_path):
-            raise HTTPException(status_code=404, detail="Job ID not found.")
-        db_job = Job(id=job_id, status="queued", filename=os.path.basename(file_path))
-        db.add(db_job)
-        await db.commit()
+        raise HTTPException(status_code=404, detail="Job ID not found.")
         
     db_job.status = "processing"
     await db.commit()
@@ -99,13 +134,13 @@ async def trigger_cleaning(
             cleaned_result = CleanedData(
                 job_id=job_id,
                 prompt=request.prompt,
-                cleaned_file_path=os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv"),
+                cleaned_file_path=get_object_storage_service().object_uri(cleaned_output_key(job_id)),
                 cleaned_data=response.cleaned_data,
             )
             db.add(cleaned_result)
         else:
             cleaned_result.prompt = request.prompt
-            cleaned_result.cleaned_file_path = os.path.join(settings.OUTPUT_DIR, f"{job_id}_cleaned.csv")
+            cleaned_result.cleaned_file_path = get_object_storage_service().object_uri(cleaned_output_key(job_id))
             cleaned_result.cleaned_data = response.cleaned_data
 
         db_job.status = "completed"
@@ -145,10 +180,22 @@ async def download_cleaned(job_id: str, db: AsyncSession = Depends(get_db)):
     if cleaned_result is None:
         raise HTTPException(status_code=404, detail="Cleaned data not found. Run cleaning first.")
 
-    path = cleaned_result.cleaned_file_path
-    if not os.path.exists(path):
+    fd, path = tempfile.mkstemp(prefix=f"{job_id}_cleaned_", suffix=".csv")
+    os.close(fd)
+    restored = get_object_storage_service().download_file(
+        cleaned_output_key(job_id),
+        path,
+    )
+    if not restored:
+        if os.path.exists(path):
+            os.remove(path)
         raise HTTPException(status_code=404, detail="Cleaned file not found. Run cleaning again.")
-    return FileResponse(path, media_type='text/csv', filename=f"{job_id}_cleaned.csv")
+    return FileResponse(
+        path,
+        media_type="text/csv",
+        filename=f"{job_id}_cleaned.csv",
+        background=BackgroundTask(lambda: os.path.exists(path) and os.remove(path)),
+    )
 
 @router.get("/test-ollama")
 async def test_ollama_connection(prompt: str = "Reply with a short health check message."):

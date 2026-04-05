@@ -7,6 +7,7 @@ class JobResponse(BaseModel):
     job_id: str = Field(..., alias="id", description="Unique identifier for the processing job")
     status: str = Field(..., description="Current status of the job")
     filename: Optional[str] = Field(None, description="Original uploaded filename")
+    file_url: Optional[str] = Field(None, description="Stored object storage URL for the uploaded file")
     message: Optional[str] = Field(None, description="Additional status message or error detail")
     analysis: Optional[Dict[str, Any]] = Field(None, description="Generated output metadata for completed jobs")
     created_at: Optional[datetime] = None
@@ -33,6 +34,12 @@ class DatasetAnalysisResponse(BaseModel):
     job_id: str = Field(description="The job ID for this dataset")
     quality_score: int = Field(ge=0, le=100, description="Overall quality score from 0 to 100")
     suggestions: List[DataSuggestion] = Field(default_factory=list, description="List of suggested cleaning actions")
+
+class FileUploadResponse(BaseModel):
+    file_id: str = Field(description="The stored file ID")
+    filename: Optional[str] = Field(None, description="Original uploaded filename")
+    file_url: str = Field(description="Stored object storage URL for the uploaded file")
+    status: str = Field(description="Upload status")
 
 # User Request / Response Schemas
 class CleanDataRequest(BaseModel):

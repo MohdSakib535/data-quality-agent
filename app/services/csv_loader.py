@@ -1,13 +1,18 @@
 import csv
 import os
 import shutil
+import tempfile
 import uuid
+from contextlib import contextmanager
 from functools import lru_cache
 
 from fastapi import UploadFile
 import pandas as pd
-
 from app.core.config import settings
+from app.services.object_storage import (
+    get_object_storage_service,
+    raw_upload_key,
+)
 
 SUPPORTED_UPLOAD_EXTENSIONS = {".csv", ".xlsx", ".xls"}
 
@@ -49,28 +54,46 @@ def _save_excel_upload(upload_file: UploadFile, file_path: str, extension: str) 
     dataframe.to_csv(file_path, index=False)
 
 
-def save_upload_file(upload_file: UploadFile) -> str:
-    """Save the uploaded file and return a job_id."""
+def save_upload_file(upload_file: UploadFile) -> tuple[str, str]:
+    """Save the uploaded file and return the job_id plus object storage URL."""
     extension = _get_upload_extension(upload_file.filename)
     if extension not in SUPPORTED_UPLOAD_EXTENSIONS:
         raise ValueError("Only CSV or Excel files (.csv, .xlsx, .xls) are allowed.")
 
     job_id = str(uuid.uuid4())
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{job_id}.csv")
+    fd, file_path = tempfile.mkstemp(prefix=f"{job_id}_", suffix=".csv")
+    os.close(fd)
 
-    if extension == ".csv":
-        _save_csv_upload(upload_file, file_path)
-    else:
-        _save_excel_upload(upload_file, file_path, extension)
+    try:
+        if extension == ".csv":
+            _save_csv_upload(upload_file, file_path)
+        else:
+            _save_excel_upload(upload_file, file_path, extension)
 
-    return job_id
+        storage_service = get_object_storage_service()
+        file_url = storage_service.upload_file(file_path, raw_upload_key(job_id))
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+    return job_id, file_url
 
 
-def _get_file_path(job_id: str) -> str:
-    file_path = os.path.join(settings.UPLOAD_DIR, f"{job_id}.csv")
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"File for job {job_id} not found.")
-    return file_path
+@contextmanager
+def _download_job_file(job_id: str):
+    fd, file_path = tempfile.mkstemp(prefix=f"{job_id}_", suffix=".csv")
+    os.close(fd)
+    try:
+        restored = get_object_storage_service().download_file(
+            raw_upload_key(job_id),
+            file_path,
+        )
+        if not restored:
+            raise FileNotFoundError(f"File for job {job_id} not found.")
+        yield file_path
+    finally:
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
 
 @lru_cache(maxsize=256)
@@ -129,20 +152,21 @@ def _read_csv(file_path: str, encoding: str, delimiter: str, **kwargs):
 
 
 def load_csv(job_id: str, **kwargs) -> pd.DataFrame:
-    """Load the saved CSV file into a pandas DataFrame."""
-    file_path = _get_file_path(job_id)
-    csv_options = _detect_csv_options(file_path)
-    return _read_csv(file_path, csv_options["encoding"], csv_options["delimiter"], **kwargs)
+    """Load the bucket-backed CSV file into a pandas DataFrame."""
+    with _download_job_file(job_id) as file_path:
+        csv_options = _detect_csv_options(file_path)
+        return _read_csv(file_path, csv_options["encoding"], csv_options["delimiter"], **kwargs)
 
 
 def iter_csv_chunks(job_id: str, chunksize: int | None = None):
-    """Yield CSV data in chunks so large files don't need to be loaded at once."""
-    file_path = _get_file_path(job_id)
-    csv_options = _detect_csv_options(file_path)
-    effective_chunksize = chunksize or settings.CHUNK_SIZE
-    return _read_csv(
-        file_path,
-        csv_options["encoding"],
-        csv_options["delimiter"],
-        chunksize=effective_chunksize,
-    )
+    """Yield CSV data in chunks from object storage without persisting local copies."""
+    with _download_job_file(job_id) as file_path:
+        csv_options = _detect_csv_options(file_path)
+        effective_chunksize = chunksize or settings.CHUNK_SIZE
+        for chunk in _read_csv(
+            file_path,
+            csv_options["encoding"],
+            csv_options["delimiter"],
+            chunksize=effective_chunksize,
+        ):
+            yield chunk

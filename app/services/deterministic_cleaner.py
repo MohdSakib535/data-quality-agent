@@ -110,6 +110,20 @@ def _compact_column_profile(column_profile: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _column_issue_percent(column_profile: dict[str, Any]) -> float:
+    issue_keys = (
+        "null_percent",
+        "invalid_phone_percent",
+        "invalid_email_percent",
+        "invalid_date_percent",
+        "invalid_numeric_percent",
+        "key_duplicate_percent",
+        "casing_inconsistency_percent",
+        "whitespace_inconsistency_percent",
+    )
+    return max(float(column_profile.get(key, 0.0)) for key in issue_keys)
+
+
 def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
     row_count = len(df)
     row_count_safe = max(row_count, 1)
@@ -275,10 +289,16 @@ def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
 
     ordered_columns = sorted(column_profiles, key=lambda item: item.get("_issue_score", 0.0), reverse=True)
     compact_columns = [_compact_column_profile(column) for column in ordered_columns[:MAX_PROFILE_COLUMNS]]
+    affected_column_count = sum(1 for column in column_profiles if column.get("_issue_score", 0.0) > 0.0)
+    max_column_issue_percent = max((float(column.get("_issue_score", 0.0)) for column in column_profiles), default=0.0)
 
     return {
         "row_count_sampled": row_count,
+        "total_columns": len(column_profiles),
+        "affected_column_count": affected_column_count,
         "duplicate_row_percent": duplicate_row_percent,
+        "affected_column_percent": round(float(affected_column_count) / max(len(column_profiles), 1) * 100, 2),
+        "max_column_issue_percent": round(max_column_issue_percent, 2),
         "average_null_percent": _mean(null_percents),
         "average_invalid_format_percent": _mean(invalid_format_percents),
         "average_text_inconsistency_percent": _mean(text_inconsistency_percents),
@@ -290,13 +310,36 @@ def build_dataset_profile(df: pd.DataFrame) -> dict[str, Any]:
 
 
 def compute_quality_score(profile: dict[str, Any]) -> int:
-    score = 100.0
-    score -= min(20.0, 20.0 * (float(profile.get("average_null_percent", 0.0)) / 100.0))
-    score -= min(20.0, 20.0 * (float(profile.get("average_invalid_format_percent", 0.0)) / 100.0))
-    score -= min(15.0, 15.0 * (float(profile.get("duplicate_row_percent", 0.0)) / 100.0))
-    score -= min(10.0, 10.0 * (float(profile.get("average_text_inconsistency_percent", 0.0)) / 100.0))
-    score -= min(10.0, 10.0 * (float(profile.get("average_numeric_parse_failure_percent", 0.0)) / 100.0))
-    return max(0, min(100, int(round(score))))
+    columns = profile.get("columns", [])
+    total_columns = max(int(profile.get("total_columns", len(columns) or 1)), 1)
+    affected_column_count = int(
+        profile.get(
+            "affected_column_count",
+            sum(1 for column in columns if _column_issue_percent(column) > 0.0),
+        )
+    )
+    affected_column_percent = float(
+        profile.get("affected_column_percent", (affected_column_count / total_columns) * 100.0)
+    )
+    max_column_issue_percent = float(
+        profile.get(
+            "max_column_issue_percent",
+            max((_column_issue_percent(column) for column in columns), default=0.0),
+        )
+    )
+    dataset_issue_count = len(profile.get("dataset_issues", []))
+
+    penalty = 0.0
+    penalty += min(20.0, 20.0 * (float(profile.get("average_null_percent", 0.0)) / 100.0))
+    penalty += min(20.0, 20.0 * (float(profile.get("average_invalid_format_percent", 0.0)) / 100.0))
+    penalty += min(10.0, 10.0 * (float(profile.get("duplicate_row_percent", 0.0)) / 100.0))
+    penalty += min(10.0, 10.0 * (float(profile.get("average_text_inconsistency_percent", 0.0)) / 100.0))
+    penalty += min(10.0, 10.0 * (float(profile.get("average_numeric_parse_failure_percent", 0.0)) / 100.0))
+    penalty += min(10.0, 10.0 * (affected_column_percent / 100.0))
+    penalty += min(15.0, 15.0 * (max_column_issue_percent / 100.0))
+    penalty += min(5.0, 5.0 * (dataset_issue_count / 6.0))
+
+    return max(0, min(100, int(round(100.0 - penalty))))
 
 
 def generate_rule_based_suggestions(profile: dict[str, Any]) -> list[DataSuggestion]:

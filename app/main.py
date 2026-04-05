@@ -2,6 +2,7 @@ import asyncio
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 from app.api.routes import router
 from app.routers.chat_with_data import router as chat_router
 from app.core.config import settings
@@ -18,13 +19,16 @@ async def on_startup():
     from app.db.session import engine
     from app.db.base import Base
     from app.services.ai_cleaner import warm_analysis_runtime_cache
+    from app.services.object_storage import get_object_storage_service
     import app.models.chat_history
     import app.models.cleaned_data
     import app.models.job
     import app.models.semantic_column_metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(text("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS file_url VARCHAR"))
     await asyncio.to_thread(warm_analysis_runtime_cache)
+    await asyncio.to_thread(get_object_storage_service().ensure_bucket)
 
 # Allow CORS for potential frontend clients
 app.add_middleware(

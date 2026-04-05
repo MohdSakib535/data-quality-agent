@@ -10,6 +10,7 @@ class Job(Base):
     id: Mapped[str] = mapped_column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
     status: Mapped[str] = mapped_column(String, index=True)
     filename: Mapped[str] = mapped_column(String, nullable=True)
+    file_url: Mapped[str] = mapped_column(String, nullable=True)
     message: Mapped[str] = mapped_column(String, nullable=True)
     quality_score: Mapped[int] = mapped_column(Integer, nullable=True)
     analysis: Mapped[dict] = mapped_column(JSON, nullable=True)
