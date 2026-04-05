@@ -8,7 +8,7 @@ services:
     environment:
       DATABASE_URL: postgresql+asyncpg://postgres:admin@host.docker.internal:5432/ai_cleaning_db
       OLLAMA_BASE_URL: http://host.docker.internal:11434
-      OLLAMA_MODEL: qwen2.5-coder
+      OLLAMA_MODEL: qwen2.5:7b-instruct
     ports:
       - "8000:8000"
     volumes:

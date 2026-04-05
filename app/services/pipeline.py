@@ -1,7 +1,10 @@
 import os
-import pandas as pd
 import asyncio
+import logging
+import time
 from datetime import date, datetime
+
+import pandas as pd
 
 from app.services.csv_loader import iter_csv_chunks, load_csv
 from app.services.ai_cleaner import (
@@ -11,8 +14,11 @@ from app.services.ai_cleaner import (
     prompt_removes_exact_duplicates,
     prompt_requires_ai_cleaning,
 )
+from app.services.deterministic_cleaner import build_dataset_profile
 from app.schemas.job import DatasetAnalysisResponse, CleanDataResponse
 from app.core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _sanitize_json_value(value):
@@ -45,23 +51,10 @@ def _load_analysis_sample(job_id: str) -> pd.DataFrame:
     return fast without scanning the full dataset.
     """
     max_rows = max(1, settings.ANALYSIS_SAMPLE_ROWS)
-    sample_chunks: list[pd.DataFrame] = []
-    collected_rows = 0
-    chunk_size = min(max_rows, max(settings.CHUNK_SIZE, 1000))
-
-    for chunk_df in iter_csv_chunks(job_id, chunksize=chunk_size):
-        sample_chunks.append(chunk_df)
-        collected_rows += len(chunk_df)
-        if collected_rows >= max_rows:
-            break
-
-    if not sample_chunks:
-        return load_csv(job_id, nrows=0)
-
-    sample_df = pd.concat(sample_chunks, ignore_index=True)
-    if len(sample_df) > max_rows:
-        return sample_df.head(max_rows)
-    return sample_df
+    sample_df = load_csv(job_id, nrows=max_rows)
+    if sample_df.empty:
+        return sample_df
+    return sample_df.sample(n=min(max_rows, len(sample_df)), random_state=42)
 
 
 def _clean_csv_file_with_prompt(job_id: str, prompt: str) -> tuple[str, list[dict], int]:
@@ -128,13 +121,29 @@ async def analyze_csv(job_id: str) -> DatasetAnalysisResponse:
     """
     Run analysis over a bounded sample for fast upload response on large files.
     """
-    df = await asyncio.to_thread(_load_analysis_sample, job_id)
-    
-    # Analyze
-    response = await asyncio.to_thread(analyze_dataset, df)
-    response.job_id = job_id
-    
-    return response
+    total_start = time.perf_counter()
+    file_load_ms = 0.0
+    profile_build_ms = 0.0
+    llm_request_ms = 0.0
+
+    try:
+        file_load_start = time.perf_counter()
+        df = await asyncio.to_thread(_load_analysis_sample, job_id)
+        file_load_ms = (time.perf_counter() - file_load_start) * 1000
+
+        profile_build_start = time.perf_counter()
+        profile = await asyncio.to_thread(build_dataset_profile, df)
+        profile_build_ms = (time.perf_counter() - profile_build_start) * 1000
+
+        response, llm_request_ms = await analyze_dataset(profile)
+        response.job_id = job_id
+        return response
+    finally:
+        total_analysis_ms = (time.perf_counter() - total_start) * 1000
+        logger.info("[analysis] file_load_ms=%d", round(file_load_ms))
+        logger.info("[analysis] profile_build_ms=%d", round(profile_build_ms))
+        logger.info("[analysis] llm_request_ms=%d", round(llm_request_ms))
+        logger.info("[analysis] total_analysis_ms=%d", round(total_analysis_ms))
 
 async def clean_csv_with_prompt(job_id: str, prompt: str) -> CleanDataResponse:
     """

@@ -7,12 +7,71 @@ import pandas as pd
 from app.services.ai_cleaner import (
     _extract_json_payload,
     _invoke_cleaning_batch_with_fallback,
+    analyze_dataset,
     clean_dataframe_chunk,
     clean_dataset_with_prompt,
 )
 
 
 class CleanDatasetWithPromptTests(unittest.TestCase):
+    def test_analyze_dataset_returns_llm_generated_suggestions(self):
+        source_df = pd.DataFrame(
+            [
+                {"name": " Alice ", "email": None},
+                {"name": "Bob", "email": "bob@example.com"},
+            ]
+        )
+        llm_response = json.dumps(
+            {
+                "quality_score": 61,
+                "suggestions": [
+                    {
+                        "issue_description": "Email values are missing in some rows.",
+                        "priority": "High",
+                        "resolution_prompt": "Fill missing email values with N/A and trim name whitespace.",
+                    }
+                ],
+            }
+        )
+
+        class FakeChain:
+            def __init__(self, response):
+                self.response = response
+
+            def __or__(self, other):
+                return self
+
+            def invoke(self, payload):
+                return self.response
+
+        class FakePrompt:
+            def __init__(self, response):
+                self.response = response
+
+            def __or__(self, other):
+                return FakeChain(self.response)
+
+        with patch("app.services.ai_cleaner.analysis_prompt_template", FakePrompt(llm_response)):
+            with patch("app.services.ai_cleaner.ChatOllama", return_value=object()):
+                response = analyze_dataset(source_df)
+
+        self.assertEqual(response.quality_score, 61)
+        self.assertEqual(len(response.suggestions), 1)
+        self.assertEqual(response.suggestions[0].issue_description, "Email values are missing in some rows.")
+        self.assertEqual(
+            response.suggestions[0].resolution_prompt,
+            "Fill missing email values with N/A and trim name whitespace.",
+        )
+
+    def test_analyze_dataset_raises_when_llm_analysis_fails(self):
+        source_df = pd.DataFrame([{"name": "Alice"}])
+
+        with patch("app.services.ai_cleaner.ChatOllama", side_effect=RuntimeError("ollama offline")):
+            with self.assertRaises(RuntimeError) as exc:
+                analyze_dataset(source_df)
+
+        self.assertIn("LLM analysis failed", str(exc.exception))
+
     def test_extract_json_payload_accepts_python_literal_style_response(self):
         raw = """```json
         [{'name': 'Alice', 'active': True, 'notes': None}]

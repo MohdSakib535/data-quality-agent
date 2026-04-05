@@ -1,21 +1,46 @@
 import json
 import re
 import ast
+import logging
+import urllib.error
+import urllib.request
 from typing import List, Dict, Any
+from functools import lru_cache
+import time
+
+import httpx
 import pandas as pd
-from langchain_core.output_parsers import JsonOutputParser, StrOutputParser
-from app.prompts.cleaning_prompts import analysis_prompt_template, clean_data_prompt_template
-from app.schemas.job import DataSuggestion, DatasetAnalysisPayload, DatasetAnalysisResponse
+from langchain_core.output_parsers import StrOutputParser
+from app.prompts.cleaning_prompts import clean_data_prompt_template
+from app.schemas.job import DataSuggestion, DatasetAnalysisResponse
 from app.core.config import settings
 from app.services.deterministic_cleaner import (
     _to_snake_case,
-    analyze_dataset_deterministically,
+    compute_quality_score,
+    generate_rule_based_suggestions,
 )
 
 try:
     from langchain_ollama import ChatOllama
 except ImportError:
     from langchain_community.chat_models import ChatOllama
+
+logger = logging.getLogger(__name__)
+
+ANALYSIS_LLM_TIMEOUT_SECONDS = 20
+ANALYSIS_LLM_OPTIONS = {
+    "temperature": 0,
+    "num_predict": 400,
+}
+ANALYSIS_SYSTEM_PROMPT = (
+    "You are a strict data quality issue summarizer. "
+    "You will receive a deterministic dataset profile and a few sample rows. "
+    "Return JSON only with this exact schema: "
+    '{"suggestions":[{"issue_description":"...","priority":"High|Medium|Low","resolution_prompt":"..."}]}. '
+    "Do not output markdown. Do not output prose. Do not compute quality_score. "
+    "Use only the provided detected issues and profile metrics. "
+    "Keep suggestions dataset-level and generic. Return at most 5 suggestions."
+)
 
 
 def _coerce_python_payload(candidate: str) -> Any:
@@ -62,166 +87,99 @@ def _extract_json_payload(raw_response: str) -> Any:
 
     raise ValueError("Model response did not contain a valid JSON payload.")
 
-def _suggestion_key(suggestion: DataSuggestion) -> str:
-    return "|".join(
-        [
-            suggestion.issue_description.strip().lower(),
-            suggestion.priority.strip().lower(),
-            suggestion.resolution_prompt.strip().lower(),
-        ]
-    )
-
-
-def _generic_resolution_prompt(issue_description: str, current_prompt: str) -> str:
-    suggestion_text = f"{issue_description} {current_prompt}".lower()
-
-    if any(keyword in suggestion_text for keyword in ["missing", "null", "blank", "empty", "n/a"]):
-        return (
-            "Review the dataset for missing or placeholder values across all affected columns and replace them "
-            "with the literal string N/A wherever the value is missing. Treat blank strings, whitespace-only "
-            "cells, null, NULL, NA, -, unknown, and other visibly empty placeholders as missing values. Apply "
-            "the replacement consistently across the dataset, preserve all non-empty valid values as they are, "
-            "and do not invent or guess any new data beyond converting missing entries to N/A."
-        )
-
-    if "duplicate" in suggestion_text:
-        return (
-            "Identify exact duplicate records across the dataset and remove redundant copies while keeping one "
-            "canonical version of each repeated row. Preserve legitimate repeated values that are not true "
-            "duplicates, and avoid merging rows unless all corresponding fields clearly represent the same record."
-        )
-
-    if any(keyword in suggestion_text for keyword in ["header", "column name", "column names", "snake_case"]):
-        return (
-            "Normalize all column headers consistently across the dataset. Trim surrounding whitespace, remove "
-            "punctuation noise, convert names to lowercase snake_case, and ensure each header is clear, stable, "
-            "and unique without changing the meaning of the column."
-        )
-
-    if "whitespace" in suggestion_text or "leading or trailing" in suggestion_text:
-        return (
-            "Trim leading and trailing whitespace in all affected text fields across the dataset. Preserve "
-            "meaningful internal spacing unless it is clearly accidental, and ensure values that become empty "
-            "after trimming are handled consistently as blank or missing data."
-        )
-
-    if any(keyword in suggestion_text for keyword in ["capitalization", "casing", "spelling", "formatting"]):
-        return (
-            "Standardize capitalization, spelling, and formatting for repeated text values that represent the same "
-            "meaning. Apply one canonical form consistently across the dataset while preserving genuinely distinct "
-            "values and avoiding unsupported corrections."
-        )
-
-    return (
-        f"Apply a consistent dataset-wide cleaning rule for this issue: {issue_description.strip()} "
-        "Review all affected rows and columns, standardize equivalent values into one canonical format, preserve "
-        "valid distinctions, and avoid guessing or changing unrelated data."
-    )
-
-
 def _normalize_analysis_suggestion(suggestion: DataSuggestion) -> DataSuggestion:
     return DataSuggestion(
         issue_description=suggestion.issue_description.strip(),
         priority=suggestion.priority.strip(),
-        resolution_prompt=_generic_resolution_prompt(
-            suggestion.issue_description,
-            suggestion.resolution_prompt,
-        ),
+        resolution_prompt=suggestion.resolution_prompt.strip(),
     )
 
 
-def _merge_analysis_payloads(
-    deterministic: DatasetAnalysisPayload,
-    ai_payload: DatasetAnalysisPayload | None,
-) -> DatasetAnalysisPayload:
-    deterministic = DatasetAnalysisPayload(
-        quality_score=deterministic.quality_score,
-        suggestions=[_normalize_analysis_suggestion(s) for s in deterministic.suggestions],
+@lru_cache(maxsize=16)
+def _resolve_ollama_model_name_cached(
+    base_url: str,
+    configured_model: str,
+    timeout: int,
+) -> str:
+    """
+    Resolve the configured Ollama model to an installed model name, allowing
+    tagged variants such as `model:latest` or `model:7b`.
+    """
+    tags_url = f"{base_url.rstrip('/')}/api/tags"
+
+    try:
+        with urllib.request.urlopen(tags_url, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+        return configured_model
+
+    available_models = [model.get("name", "") for model in payload.get("models", [])]
+    for model_name in available_models:
+        if model_name == configured_model or model_name.startswith(f"{configured_model}:"):
+            return model_name
+
+    return configured_model
+
+
+def _resolve_ollama_model_name() -> str:
+    return _resolve_ollama_model_name_cached(
+        settings.OLLAMA_BASE_URL,
+        settings.OLLAMA_MODEL,
+        settings.OLLAMA_TIMEOUT,
     )
 
-    if ai_payload is None:
-        return deterministic
 
-    ai_payload = DatasetAnalysisPayload(
-        quality_score=ai_payload.quality_score,
-        suggestions=[_normalize_analysis_suggestion(s) for s in ai_payload.suggestions],
-    )
-
-    merged_suggestions: List[DataSuggestion] = []
-    seen = set()
-
-    for suggestion in list(ai_payload.suggestions) + list(deterministic.suggestions):
-        key = _suggestion_key(suggestion)
-        if key in seen:
-            continue
-        seen.add(key)
-        merged_suggestions.append(suggestion)
-
-    merged_score = int(round((deterministic.quality_score + ai_payload.quality_score) / 2))
-    return DatasetAnalysisPayload(
-        quality_score=max(0, min(100, merged_score)),
-        suggestions=merged_suggestions[:5],
-    )
+def warm_analysis_runtime_cache() -> None:
+    _resolve_ollama_model_name()
 
 
-def _build_dataset_profile(df: pd.DataFrame) -> Dict[str, Any]:
-    row_count = len(df)
-    column_count = len(df.columns)
-    total_cells = max(row_count * max(column_count, 1), 1)
-    missing_cells = int(df.isna().sum().sum())
-    duplicate_rows = int(df.duplicated().sum()) if row_count > 0 else 0
-
-    dtype_counts: Dict[str, int] = {}
-    for dtype in df.dtypes.astype(str):
-        dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
-
-    object_columns = df.select_dtypes(include=["object", "string"]).columns.tolist()
-    numeric_columns = df.select_dtypes(include=["number"]).columns.tolist()
-
-    missing_by_column = (
-        df.isna()
-        .mean()
-        .sort_values(ascending=False)
-        .head(8)
-    )
-    highest_missing_columns = [
-        {
-            "column": str(column),
-            "missing_ratio": round(float(ratio), 4),
-        }
-        for column, ratio in missing_by_column.items()
-        if float(ratio) > 0
-    ]
-
-    text_column_samples = []
-    for column in object_columns[:8]:
-        series = df[column].dropna().astype(str).head(3).tolist()
-        if series:
-            text_column_samples.append({
-                "column": str(column),
-                "examples": series,
-            })
-
-    numeric_column_ranges = []
-    for column in numeric_columns[:8]:
-        series = df[column].dropna()
-        if not series.empty:
-            numeric_column_ranges.append({
-                "column": str(column),
-                "min": float(series.min()),
-                "max": float(series.max()),
-            })
-
-    return {
-        "row_count": row_count,
-        "column_count": column_count,
-        "missing_cell_ratio": round(missing_cells / total_cells, 4),
-        "duplicate_row_ratio": round(duplicate_rows / max(row_count, 1), 4),
-        "dtype_counts": dtype_counts,
-        "highest_missing_columns": highest_missing_columns,
-        "text_column_samples": text_column_samples,
-        "numeric_column_ranges": numeric_column_ranges,
+def _build_analysis_llm_payload(profile: dict[str, Any]) -> dict[str, Any]:
+    payload = {
+        "row_count_sampled": profile.get("row_count_sampled", 0),
+        "quality_score": profile.get("quality_score", 0),
+        "duplicate_row_percent": profile.get("duplicate_row_percent", 0.0),
+        "columns": profile.get("columns", []),
+        "dataset_issues": profile.get("dataset_issues", []),
+        "sample_rows": profile.get("sample_rows", [])[:5],
     }
+    return payload
+
+
+def _build_analysis_prompt(profile: dict[str, Any]) -> str:
+    llm_payload = _build_analysis_llm_payload(profile)
+    return (
+        f"{ANALYSIS_SYSTEM_PROMPT}\n\n"
+        f"Profile JSON:\n{json.dumps(llm_payload, ensure_ascii=False, separators=(',', ':'))}\n"
+    )
+
+
+async def _request_analysis_suggestions_from_llm(profile: dict[str, Any]) -> list[DataSuggestion]:
+    resolved_model = _resolve_ollama_model_name()
+    payload = {
+        "model": resolved_model,
+        "prompt": _build_analysis_prompt(profile),
+        "stream": False,
+        "format": "json",
+        "options": ANALYSIS_LLM_OPTIONS,
+    }
+    async with httpx.AsyncClient(timeout=ANALYSIS_LLM_TIMEOUT_SECONDS) as client:
+        response = await client.post(
+            f"{settings.OLLAMA_BASE_URL.rstrip('/')}/api/generate",
+            json=payload,
+        )
+        response.raise_for_status()
+        body = response.json()
+
+    result_dict = _extract_json_payload(body.get("response", ""))
+    suggestions_payload = result_dict.get("suggestions", result_dict) if isinstance(result_dict, dict) else result_dict
+    if not isinstance(suggestions_payload, list):
+        raise ValueError("Model response did not contain a suggestions list.")
+
+    suggestions = [
+        _normalize_analysis_suggestion(DataSuggestion(**suggestion))
+        for suggestion in suggestions_payload[:5]
+    ]
+    return suggestions
 
 
 def _normalize_cleaned_batch_payload(cleaned_batch: Any) -> Any:
@@ -690,58 +648,28 @@ def _invoke_cleaning_batch_with_fallback(
         return left_cleaned + right_cleaned
 
 
-def analyze_dataset(df: pd.DataFrame) -> DatasetAnalysisResponse:
+async def analyze_dataset(profile: dict[str, Any]) -> tuple[DatasetAnalysisResponse, float]:
     """
-    Sample the dataframe and ask the AI to analyze its quality and suggest cleaning prompts.
+    Summarize a deterministic profile into user-facing suggestions.
+    The quality score is computed deterministically and never by the LLM.
     """
-    deterministic_analysis = analyze_dataset_deterministically(df)
+    quality_score = compute_quality_score(profile)
+    enriched_profile = {**profile, "quality_score": quality_score}
 
-    # Scale row sampling by column count so large wide datasets stay within context.
-    target_cell_budget = 1200
-    sample_size = min(
-        len(df),
-        max(5, min(20, target_cell_budget // max(len(df.columns), 1))),
-    )
-    sample_df = df.sample(n=sample_size, random_state=42) if len(df) > 50 else df
-    dataset_profile_json = json.dumps(_build_dataset_profile(df), indent=2)
-    
-    # Fill NA values with None for JSON serialization
-    sample_df = sample_df.where(pd.notnull(sample_df), None)
-    dataset_sample_json = sample_df.to_json(orient="records", date_format="iso")
-    
-    llm = ChatOllama(model=settings.OLLAMA_MODEL, base_url=settings.OLLAMA_BASE_URL, temperature=0.0)
-    parser = JsonOutputParser(pydantic_object=DatasetAnalysisPayload)
-    
-    chain = analysis_prompt_template | llm | StrOutputParser()
-    
+    llm_start = time.perf_counter()
     try:
-        raw_response = chain.invoke({
-            "dataset_profile_json": dataset_profile_json,
-            "dataset_sample_json": dataset_sample_json,
-            "format_instructions": parser.get_format_instructions()
-        })
-        
-        result_dict = _extract_json_payload(raw_response)
-        
-        # In case the payload is wrapped under a key
-        if isinstance(result_dict, dict) and "suggestions" not in result_dict and len(result_dict) == 1:
-             result_dict = list(result_dict.values())[0]
+        suggestions = await _request_analysis_suggestions_from_llm(enriched_profile)
+    except Exception as exc:
+        logger.warning("Falling back to rule-based analysis suggestions: %s", exc)
+        suggestions = generate_rule_based_suggestions(enriched_profile)
+    llm_request_ms = (time.perf_counter() - llm_start) * 1000
 
-        ai_payload = DatasetAnalysisPayload(**result_dict)
-        merged_payload = _merge_analysis_payloads(deterministic_analysis, ai_payload)
-        return DatasetAnalysisResponse(
-            job_id="",
-            quality_score=merged_payload.quality_score,
-            suggestions=merged_payload.suggestions,
-        )
-    except Exception as e:
-        print(f"AI Analysis failed: {e}")
-        # Fall back to deterministic profiling instead of returning an empty analysis.
-        return DatasetAnalysisResponse(
-            job_id="",
-            quality_score=deterministic_analysis.quality_score,
-            suggestions=deterministic_analysis.suggestions,
-        )
+    response = DatasetAnalysisResponse(
+        job_id="",
+        quality_score=quality_score,
+        suggestions=suggestions,
+    )
+    return response, llm_request_ms
 
 def clean_dataset_with_prompt(df: pd.DataFrame, user_prompt: str) -> pd.DataFrame:
     """

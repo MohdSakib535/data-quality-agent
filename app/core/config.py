@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     
     # LLM Settings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
-    OLLAMA_MODEL: str = "qwen2.5-coder" # Default model, user can change
+    OLLAMA_MODEL: str = "qwen2.5:7b-instruct" # Default model, user can change
     OLLAMA_HOST: Optional[str] = None
     OLLAMA_TIMEOUT: int = 30
     
@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     # Processing settings
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
     AI_BATCH_SIZE: int = 50
-    ANALYSIS_SAMPLE_ROWS: int = 5000
+    ANALYSIS_SAMPLE_ROWS: int = 500
     CLEAN_PREVIEW_ROWS: int = 25
     CONFIDENCE_AUTO_ACCEPT: float = 0.95
     CONFIDENCE_REVIEW: float = 0.75

@@ -1,3 +1,5 @@
+import asyncio
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
@@ -15,12 +17,14 @@ app = FastAPI(
 async def on_startup():
     from app.db.session import engine
     from app.db.base import Base
+    from app.services.ai_cleaner import warm_analysis_runtime_cache
     import app.models.chat_history
     import app.models.cleaned_data
     import app.models.job
     import app.models.semantic_column_metadata
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    await asyncio.to_thread(warm_analysis_runtime_cache)
 
 # Allow CORS for potential frontend clients
 app.add_middleware(
