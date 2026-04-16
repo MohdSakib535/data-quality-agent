@@ -11,19 +11,31 @@ from app.models.analysis_suggestion import AnalysisSuggestion
 from app.models.cleaned_data import CleanedData
 from app.models.job import Job
 from app.schemas.job import DataSuggestion, DatasetAnalysisResponse, SuggestionDetailResponse
+from app.services.analysis_suggestions import (
+    build_data_suggestion,
+    build_suggestion_detail_response,
+    coalesce_clean_quality_score,
+    should_suppress_suggestion,
+)
 from app.services.pipeline import analyze_csv
 
 router = APIRouter(prefix="/analysis", tags=["analysis"])
 logger = logging.getLogger(__name__)
 
 
+def _resolve_is_clean_flag(is_clean: bool, is_clean_camel: bool | None) -> bool:
+    return is_clean if is_clean_camel is None else is_clean_camel
+
+
 @router.post("/{file_id}", response_model=DatasetAnalysisResponse)
 async def analyze_uploaded_file(
     file_id: str,
     is_clean: bool = Query(default=False, description="Analyze the cleaned file when true; raw upload otherwise."),
+    is_clean_camel: bool | None = Query(default=None, alias="isClean", include_in_schema=False),
     db: AsyncSession = Depends(get_db),
 ):
     """Analyze a previously uploaded CSV/Excel file by file ID."""
+    is_clean = _resolve_is_clean_flag(is_clean, is_clean_camel)
     db_job = await db.get(Job, file_id)
     if db_job is None:
         raise HTTPException(status_code=404, detail="File ID not found.")
@@ -41,6 +53,19 @@ async def analyze_uploaded_file(
 
     try:
         analysis_response = await analyze_csv(file_id, is_clean=is_clean)
+        if is_clean and cleaned_result is not None:
+            analysis_response.quality_score = coalesce_clean_quality_score(
+                analysis_response.quality_score,
+                raw_score=db_job.quality_score,
+                previous_clean_score=cleaned_result.quality_score,
+                changes_detected=cleaned_result.changes_detected,
+            )
+        if is_clean and cleaned_result is not None and cleaned_result.prompt:
+            analysis_response.suggestions = [
+                suggestion
+                for suggestion in analysis_response.suggestions
+                if not should_suppress_suggestion(cleaned_result.prompt, suggestion)
+            ]
         await db.execute(
             delete(AnalysisSuggestion).where(
                 AnalysisSuggestion.job_id == file_id,
@@ -61,14 +86,7 @@ async def analyze_uploaded_file(
                 resolution_prompt=suggestion.resolution_prompt,
             )
             suggestion_rows.append(suggestion_row)
-            response_suggestions.append(
-                DataSuggestion(
-                    id=suggestion_id,
-                    issue_description=suggestion.issue_description,
-                    priority=suggestion.priority,
-                    resolution_prompt=suggestion.resolution_prompt,
-                )
-            )
+            response_suggestions.append(build_data_suggestion(suggestion, suggestion_id=suggestion_id))
 
         db.add_all(suggestion_rows)
         analysis_response.suggestions = response_suggestions
@@ -97,4 +115,4 @@ async def get_suggestion_detail(
     suggestion = await db.get(AnalysisSuggestion, suggestion_id)
     if suggestion is None:
         raise HTTPException(status_code=404, detail="Suggestion ID not found.")
-    return suggestion
+    return build_suggestion_detail_response(suggestion)

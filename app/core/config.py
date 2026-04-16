@@ -23,7 +23,7 @@ class Settings(BaseSettings):
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "qwen2.5:7b-instruct"
     OLLAMA_HOST: Optional[str] = None
-    OLLAMA_TIMEOUT: int = 30
+    OLLAMA_TIMEOUT: int = 300
     
     # Database settings
     DATABASE_URL: str
@@ -32,9 +32,11 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 1000 # For processing large CSVs chunk by chunk
     AI_BATCH_SIZE: int = 50
     AI_VALUE_BATCH_SIZE: int = 200
+    AI_VALUE_BATCH_PARALLELISM: int = 2
     AI_VALUE_CLEAN_MAX_UNIQUE_VALUES: int = 5000
     AI_VALUE_CLEAN_MAX_COLUMNS: int = 5
     AI_ROW_LEVEL_LARGE_DATASET_THRESHOLD: int = 50000
+    AI_PLANNER_SAMPLE_ROWS: int = 100
     ANALYSIS_SAMPLE_ROWS: int = 500
     CLEAN_PREVIEW_ROWS: int = 25
     CONFIDENCE_AUTO_ACCEPT: float = 0.95

@@ -10,6 +10,8 @@ from app.services.ai_cleaner import (
     analyze_dataset,
     clean_dataframe_chunk,
     clean_dataset_with_prompt,
+    prompt_has_deterministic_cleaning_steps,
+    prompt_requires_ai_cleaning,
 )
 
 
@@ -205,6 +207,36 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
         self.assertEqual(cleaned_df["name"].tolist(), ["Alice", "Bob"])
         self.assertEqual(cleaned_df["job_title"].tolist(), ["ui ux designer", "Sr. Engineer"])
 
+    def test_mixed_whitespace_and_ai_prompt_runs_both_cleaning_paths(self):
+        source_df = pd.DataFrame(
+            [
+                {"name": " Alice ", "job_title": "ui ux desginer"},
+                {"name": " Bob ", "job_title": "Sr. Engneer"},
+            ]
+        )
+        seen_batch_rows = []
+
+        def fake_invoke_cleaning_batch(chain, batch_json, user_prompt, expected_rows):
+            rows = json.loads(batch_json)
+            seen_batch_rows.extend(rows)
+            return [
+                {
+                    "job_title": row["job_title"].replace("desginer", "designer").replace("Engneer", "Engineer"),
+                }
+                for row in rows
+            ]
+
+        with patch("app.services.ai_cleaner._invoke_cleaning_batch", side_effect=fake_invoke_cleaning_batch):
+            cleaned_df = clean_dataframe_chunk(
+                source_df,
+                "Trim whitespace in all text fields and standardize spelling in job_title column.",
+                chain="fake-chain",
+            )
+
+        self.assertTrue(all(set(row.keys()) == {"job_title"} for row in seen_batch_rows))
+        self.assertEqual(cleaned_df["name"].tolist(), ["Alice", "Bob"])
+        self.assertEqual(cleaned_df["job_title"].tolist(), ["ui ux designer", "Sr. Engineer"])
+
     def test_ai_cleaning_reuses_duplicate_rows_within_chunk(self):
         source_df = pd.DataFrame(
             [
@@ -229,6 +261,27 @@ class CleanDatasetWithPromptTests(unittest.TestCase):
 
         self.assertEqual(expected_batch_sizes, [2])
         self.assertEqual(cleaned_df["city"].tolist(), ["Mumbai", "Mumbai", "Delhi"])
+
+    def test_analyzer_generated_phone_prompt_stays_deterministic(self):
+        source_df = pd.DataFrame(
+            [
+                {"Phone Number": "(987) 654-3210", "name": "Alice"},
+                {"Phone Number": "+1 202-555-0189", "name": "Bob"},
+            ]
+        )
+        prompt = (
+            "Only in column(s) 'Phone Number', standardize phone values into one consistent phone format, "
+            "remove punctuation noise, preserve country codes when present, keep valid phone-like values, "
+            "and leave unrelated columns untouched."
+        )
+
+        self.assertFalse(prompt_requires_ai_cleaning(prompt))
+        self.assertTrue(prompt_has_deterministic_cleaning_steps(prompt))
+
+        cleaned_df = clean_dataframe_chunk(source_df, prompt)
+
+        self.assertEqual(cleaned_df["Phone Number"].tolist(), ["9876543210", "+12025550189"])
+        self.assertEqual(cleaned_df["name"].tolist(), ["Alice", "Bob"])
 
 
 if __name__ == "__main__":

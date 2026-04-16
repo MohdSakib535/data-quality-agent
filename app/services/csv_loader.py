@@ -158,6 +158,20 @@ def _load_csv_from_key(key: str, prefix: str, **kwargs) -> pd.DataFrame:
         return _read_csv(file_path, csv_options["encoding"], csv_options["delimiter"], **kwargs)
 
 
+def _count_csv_rows_from_key(key: str, prefix: str, limit: int | None = None) -> int:
+    with _download_object_file(key, prefix) as file_path:
+        csv_options = _detect_csv_options(file_path)
+        row_count = 0
+        with open(file_path, "r", encoding=csv_options["encoding"], newline="") as csv_file:
+            reader = csv.reader(csv_file, delimiter=csv_options["delimiter"])
+            next(reader, None)
+            for _ in reader:
+                row_count += 1
+                if limit is not None and row_count >= limit:
+                    break
+        return row_count
+
+
 def load_csv(job_id: str, **kwargs) -> pd.DataFrame:
     """Load the raw uploaded CSV file into a pandas DataFrame."""
     return _load_csv_from_key(raw_upload_key(job_id), f"{job_id}_raw", **kwargs)
@@ -166,6 +180,13 @@ def load_csv(job_id: str, **kwargs) -> pd.DataFrame:
 def load_cleaned_csv(job_id: str, **kwargs) -> pd.DataFrame:
     """Load the cleaned CSV file into a pandas DataFrame."""
     return _load_csv_from_key(cleaned_output_key(job_id), f"{job_id}_clean", **kwargs)
+
+
+def count_csv_rows(job_id: str, *, is_clean: bool = False, limit: int | None = None) -> int:
+    """Count CSV rows without loading the whole file into pandas."""
+    key = cleaned_output_key(job_id) if is_clean else raw_upload_key(job_id)
+    prefix = f"{job_id}_clean" if is_clean else f"{job_id}_raw"
+    return _count_csv_rows_from_key(key, prefix, limit=limit)
 
 
 def _iter_csv_chunks_from_key(key: str, prefix: str, chunksize: int | None = None):

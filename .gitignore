@@ -8,6 +8,8 @@ __pycache__
 *.pyd
 .pytest_cache
 .mypy_cache
+alembic/__pycache__/
+alembic/versions/__pycache__/
 app/storage
 *.idea
 .DS_Store
